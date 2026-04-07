@@ -15,11 +15,20 @@ DEFAULT_VOICE = "ru-RU-DmitryNeural"
 MAX_CHUNK = 3000
 
 PROSODY = {
-    "narration":    {"pitch": "+0Hz",  "rate_offset": -3},
-    "dialogue":     {"pitch": "+3Hz",  "rate_offset": +2},
-    "question":     {"pitch": "+6Hz",  "rate_offset": 0},
-    "exclamation":  {"pitch": "+4Hz",  "rate_offset": +3},
+    "narration":    {"pitch": "-2Hz",  "rate_offset": -15},
+    "dialogue":     {"pitch": "+5Hz",  "rate_offset": +5},
+    "question":     {"pitch": "+7Hz",  "rate_offset": +7},
+    "exclamation":  {"pitch": "+12Hz", "rate_offset": +40},
+    "qexclaim":     {"pitch": "+25Hz", "rate_offset": +35},
     "pause":        {"pitch": "+0Hz",  "rate_offset": 0},
+}
+
+LABELS = {
+    "narration": "описание",
+    "dialogue": "реплика",
+    "question": "вопрос",
+    "exclamation": "восклицание",
+    "qexclaim": "вопрос-восклицание",
 }
 
 
@@ -29,14 +38,52 @@ class Segment:
     seg_type: str
 
 
-def _classify_line(line: str) -> str:
-    stripped = line.strip()
-    is_dialogue = bool(re.match(r'^[—–\-«"]', stripped))
+def _classify_text(text: str, is_speech: bool = False) -> str:
+    """Определяет тип по завершающей пунктуации."""
+    stripped = text.strip()
+    if re.search(r'[?!]{2,}', stripped) or "?!" in stripped or "!?" in stripped:
+        return "qexclaim"
     if stripped.endswith("?"):
         return "question"
     if stripped.endswith("!"):
         return "exclamation"
-    return "dialogue" if is_dialogue else "narration"
+    return "dialogue" if is_speech else "narration"
+
+
+def _split_dialogue_line(line: str) -> list[Segment]:
+    """Разбивает '— реплика — ремарка — реплика' на сегменты."""
+    stripped = re.sub(r'^[—–\-]\s*', '', line.strip())
+    parts = re.split(r'\s*—\s*', stripped)
+
+    if len(parts) == 1:
+        return [Segment(parts[0], _classify_text(parts[0], is_speech=True))]
+
+    merged: list[tuple[str, bool]] = []  # (text, is_speech)
+    for i, part in enumerate(parts):
+        part = part.strip()
+        if not part:
+            continue
+        if i == 0:
+            merged.append((part, True))
+        elif merged and merged[-1][1]:
+            prev_text = merged[-1][0]
+            prev_ends = bool(re.search(r'[.!?…]$', prev_text))
+            if prev_ends and part[0].islower():
+                merged.append((part, False))
+            elif not prev_ends:
+                merged[-1] = (f"{prev_text} — {part}", True)
+            else:
+                merged.append((part, True))
+        else:
+            merged.append((part, True))
+
+    segments: list[Segment] = []
+    for text, is_speech in merged:
+        if is_speech:
+            segments.append(Segment(text, _classify_text(text, is_speech=True)))
+        else:
+            segments.append(Segment(text, "narration"))
+    return segments
 
 
 def parse_segments(text: str) -> list[Segment]:
@@ -52,19 +99,11 @@ def parse_segments(text: str) -> list[Segment]:
             segments.append(Segment("", "pause"))
 
         lines = [ln.strip() for ln in para.split('\n') if ln.strip()]
-        current_type = None
-        current_lines: list[str] = []
-
         for line in lines:
-            lt = _classify_line(line)
-            if lt != current_type and current_lines:
-                segments.append(Segment(" ".join(current_lines), current_type))
-                current_lines = []
-            current_type = lt
-            current_lines.append(line)
-
-        if current_lines:
-            segments.append(Segment(" ".join(current_lines), current_type))
+            if re.match(r'^[—–\-]', line):
+                segments.extend(_split_dialogue_line(line))
+            else:
+                segments.append(Segment(line, _classify_text(line)))
 
     return segments
 
@@ -88,12 +127,21 @@ def split_long_segment(seg: Segment, max_len: int = MAX_CHUNK) -> list[Segment]:
 
 
 async def synthesize_segment(seg: Segment, voice: str, output: str,
-                              base_rate: int, volume: str):
+                              base_rate: int, volume: str, retries: int = 3):
     p = PROSODY.get(seg.seg_type, PROSODY["narration"])
     rate = f"{base_rate + p['rate_offset']:+d}%"
     pitch = p["pitch"]
-    comm = edge_tts.Communicate(seg.text, voice, rate=rate, volume=volume, pitch=pitch)
-    await comm.save(output)
+    text = re.sub(r'[?!]{2,}', '!', seg.text) if seg.seg_type == "qexclaim" else seg.text
+    for attempt in range(retries):
+        try:
+            comm = edge_tts.Communicate(text, voice, rate=rate, volume=volume, pitch=pitch)
+            await comm.save(output)
+            return
+        except Exception:
+            if attempt < retries - 1:
+                await asyncio.sleep(2 ** attempt)
+            else:
+                raise
 
 
 def generate_silence_mp3(output: str, duration_ms: int = 600):
@@ -101,7 +149,7 @@ def generate_silence_mp3(output: str, duration_ms: int = 600):
     import subprocess
     subprocess.run([
         "ffmpeg", "-y", "-f", "lavfi",
-        "-i", f"anullsrc=r=24000:cl=mono",
+        "-i", "anullsrc=r=24000:cl=mono",
         "-t", str(duration_ms / 1000),
         "-c:a", "libmp3lame", "-b:a", "48k",
         output
@@ -114,8 +162,8 @@ async def main():
     parser.add_argument("-o", "--output", help="Выходной .mp3")
     parser.add_argument("-v", "--voice", default=DEFAULT_VOICE,
                         help=f"Голос (по умолчанию {DEFAULT_VOICE})")
-    parser.add_argument("-r", "--rate", default="+30%",
-                        help="Базовая скорость, напр. +30%% = 1.3x (по умолчанию +30%%)")
+    parser.add_argument("-r", "--rate", default="+0%",
+                        help="Базовая скорость, напр. +30%% = 1.3x (по умолчанию +0%%)")
     parser.add_argument("--volume", default="+0%", help="Громкость, напр. +50%%")
     parser.add_argument("--list-voices", action="store_true",
                         help="Показать доступные голоса")
@@ -153,7 +201,7 @@ async def main():
     speed_multiplier = 1 + base_rate / 100
     pause_ms = max(100, int(300 / speed_multiplier))
     generate_silence_mp3(str(pause_path), pause_ms)
-    print(f"Скорость {speed_multiplier:.1f}x, пауза {pause_ms}мс")
+    print(f"Скорость {speed_multiplier:.1f}x, пауза {pause_ms}мс\n")
     pause_bytes = pause_path.read_bytes()
 
     total_audio = len([s for s in flat if s.seg_type != "pause"])
@@ -168,14 +216,13 @@ async def main():
         else:
             audio_idx += 1
             p = temp_dir / f"part_{i:04d}.mp3"
-            label = {"narration": "описание", "dialogue": "диалог",
-                     "question": "вопрос", "exclamation": "восклицание"}
-            print(f"  [{audio_idx}/{total_audio}] {label.get(seg.seg_type, seg.seg_type)}"
-                  f" — {len(seg.text)} симв.")
+            label = LABELS.get(seg.seg_type, seg.seg_type)
+            preview = seg.text[:80] + ("..." if len(seg.text) > 80 else "")
+            print(f"  [{audio_idx}/{total_audio}] [{label}]: {preview}")
             await synthesize_segment(seg, args.voice, str(p), base_rate, args.volume)
             part_files.append(p)
 
-    print("Склеиваю...")
+    print("\nСклеиваю...")
     with open(output_path, "wb") as out:
         for pf in part_files:
             out.write(pf.read_bytes())
