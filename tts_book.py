@@ -1,0 +1,190 @@
+#!/usr/bin/env python3
+"""Конвертация TXT в аудиокнигу через edge-tts с интонацией."""
+
+import argparse
+import asyncio
+import re
+import shutil
+import sys
+from dataclasses import dataclass
+from pathlib import Path
+
+import edge_tts
+
+DEFAULT_VOICE = "ru-RU-DmitryNeural"
+MAX_CHUNK = 3000
+
+PROSODY = {
+    "narration":    {"pitch": "+0Hz",  "rate_offset": -3},
+    "dialogue":     {"pitch": "+3Hz",  "rate_offset": +2},
+    "question":     {"pitch": "+6Hz",  "rate_offset": 0},
+    "exclamation":  {"pitch": "+4Hz",  "rate_offset": +3},
+    "pause":        {"pitch": "+0Hz",  "rate_offset": 0},
+}
+
+
+@dataclass
+class Segment:
+    text: str
+    seg_type: str
+
+
+def _classify_line(line: str) -> str:
+    stripped = line.strip()
+    is_dialogue = bool(re.match(r'^[—–\-«"]', stripped))
+    if stripped.endswith("?"):
+        return "question"
+    if stripped.endswith("!"):
+        return "exclamation"
+    return "dialogue" if is_dialogue else "narration"
+
+
+def parse_segments(text: str) -> list[Segment]:
+    """Разбивает текст на типизированные сегменты с паузами между абзацами."""
+    paragraphs = re.split(r'\n\s*\n', text.strip())
+    segments: list[Segment] = []
+
+    for pidx, para in enumerate(paragraphs):
+        para = para.strip()
+        if not para:
+            continue
+        if pidx > 0:
+            segments.append(Segment("", "pause"))
+
+        lines = [ln.strip() for ln in para.split('\n') if ln.strip()]
+        current_type = None
+        current_lines: list[str] = []
+
+        for line in lines:
+            lt = _classify_line(line)
+            if lt != current_type and current_lines:
+                segments.append(Segment(" ".join(current_lines), current_type))
+                current_lines = []
+            current_type = lt
+            current_lines.append(line)
+
+        if current_lines:
+            segments.append(Segment(" ".join(current_lines), current_type))
+
+    return segments
+
+
+def split_long_segment(seg: Segment, max_len: int = MAX_CHUNK) -> list[Segment]:
+    if len(seg.text) <= max_len:
+        return [seg]
+    sentences = re.split(r'(?<=[.!?…»])\s+', seg.text)
+    parts: list[Segment] = []
+    buf = ""
+    for s in sentences:
+        if len(buf) + len(s) + 1 > max_len:
+            if buf:
+                parts.append(Segment(buf.strip(), seg.seg_type))
+            buf = s
+        else:
+            buf = f"{buf} {s}" if buf else s
+    if buf.strip():
+        parts.append(Segment(buf.strip(), seg.seg_type))
+    return parts
+
+
+async def synthesize_segment(seg: Segment, voice: str, output: str,
+                              base_rate: int, volume: str):
+    p = PROSODY.get(seg.seg_type, PROSODY["narration"])
+    rate = f"{base_rate + p['rate_offset']:+d}%"
+    pitch = p["pitch"]
+    comm = edge_tts.Communicate(seg.text, voice, rate=rate, volume=volume, pitch=pitch)
+    await comm.save(output)
+
+
+def generate_silence_mp3(output: str, duration_ms: int = 600):
+    """Генерирует тишину через ffmpeg."""
+    import subprocess
+    subprocess.run([
+        "ffmpeg", "-y", "-f", "lavfi",
+        "-i", f"anullsrc=r=24000:cl=mono",
+        "-t", str(duration_ms / 1000),
+        "-c:a", "libmp3lame", "-b:a", "48k",
+        output
+    ], capture_output=True, check=True)
+
+
+async def main():
+    parser = argparse.ArgumentParser(description="TXT → аудиокнига (edge-tts)")
+    parser.add_argument("input", help="Путь к .txt файлу")
+    parser.add_argument("-o", "--output", help="Выходной .mp3")
+    parser.add_argument("-v", "--voice", default=DEFAULT_VOICE,
+                        help=f"Голос (по умолчанию {DEFAULT_VOICE})")
+    parser.add_argument("-r", "--rate", default="+30%",
+                        help="Базовая скорость, напр. +30%% = 1.3x (по умолчанию +30%%)")
+    parser.add_argument("--volume", default="+0%", help="Громкость, напр. +50%%")
+    parser.add_argument("--list-voices", action="store_true",
+                        help="Показать доступные голоса")
+    args = parser.parse_args()
+
+    if args.list_voices:
+        voices = await edge_tts.list_voices()
+        for v in voices:
+            print(f"{v['ShortName']:40s} {v['Locale']:10s} {v['Gender']}")
+        return
+
+    input_path = Path(args.input)
+    if not input_path.exists():
+        sys.exit(f"Файл не найден: {input_path}")
+
+    text = input_path.read_text(encoding="utf-8").strip()
+    if not text:
+        sys.exit("Файл пуст")
+
+    output_path = Path(args.output) if args.output else input_path.with_suffix(".mp3")
+    base_rate = int(re.match(r'([+-]?\d+)', args.rate).group(1))
+
+    segments = parse_segments(text)
+    flat: list[Segment] = []
+    for seg in segments:
+        if seg.seg_type == "pause":
+            flat.append(seg)
+        else:
+            flat.extend(split_long_segment(seg))
+
+    temp_dir = input_path.parent / ".tts_tmp"
+    temp_dir.mkdir(exist_ok=True)
+
+    pause_path = temp_dir / "pause.mp3"
+    speed_multiplier = 1 + base_rate / 100
+    pause_ms = max(100, int(300 / speed_multiplier))
+    generate_silence_mp3(str(pause_path), pause_ms)
+    print(f"Скорость {speed_multiplier:.1f}x, пауза {pause_ms}мс")
+    pause_bytes = pause_path.read_bytes()
+
+    total_audio = len([s for s in flat if s.seg_type != "pause"])
+    audio_idx = 0
+    part_files: list[Path] = []
+
+    for i, seg in enumerate(flat):
+        if seg.seg_type == "pause":
+            p = temp_dir / f"pause_{i:04d}.mp3"
+            p.write_bytes(pause_bytes)
+            part_files.append(p)
+        else:
+            audio_idx += 1
+            p = temp_dir / f"part_{i:04d}.mp3"
+            label = {"narration": "описание", "dialogue": "диалог",
+                     "question": "вопрос", "exclamation": "восклицание"}
+            print(f"  [{audio_idx}/{total_audio}] {label.get(seg.seg_type, seg.seg_type)}"
+                  f" — {len(seg.text)} симв.")
+            await synthesize_segment(seg, args.voice, str(p), base_rate, args.volume)
+            part_files.append(p)
+
+    print("Склеиваю...")
+    with open(output_path, "wb") as out:
+        for pf in part_files:
+            out.write(pf.read_bytes())
+
+    shutil.rmtree(temp_dir)
+
+    size_mb = output_path.stat().st_size / (1024 * 1024)
+    print(f"Готово: {output_path} ({size_mb:.1f} МБ)")
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
