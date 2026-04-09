@@ -10,11 +10,15 @@ import sys
 from pathlib import Path
 from typing import List
 
+from book_tts.num_utils import normalize_yo_to_e
+
 from .chunker import chunk_text_for_vosk
+from .text_utils import replace_numbers_ru
 
 
 def _normalize_for_vosk(text: str) -> str:
     t = text.strip().replace("*", "")
+    t = normalize_yo_to_e(t)
     t = (
         t.replace("«", "")
         .replace("»", "")
@@ -109,7 +113,7 @@ def synthesize_txt_to_wav(
     output_path: Path,
     model_name: str = "vosk-model-tts-ru-0.9-multi",
     speaker_id: int = 4,
-    max_chars: int = 1000,
+    max_chars: int = 300,
     pause_sec: float = 0.025,
 ) -> Path:
     from vosk_tts import Model, Synth
@@ -117,6 +121,7 @@ def synthesize_txt_to_wav(
     text = input_path.read_text(encoding="utf-8").strip()
     if not text:
         raise ValueError("Пустой входной txt")
+    text = replace_numbers_ru(text)
 
     # Базовый режим для Vosk: разбиение строго по строкам исходного файла.
     lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
@@ -170,7 +175,7 @@ def main() -> None:
     ap.add_argument("-o", "--output", help="Выходной .wav")
     ap.add_argument("--model", default="vosk-model-tts-ru-0.9-multi", help="Название модели vosk-tts")
     ap.add_argument("--speaker-id", type=int, default=4, help="speaker_id (0..4), 3/4 обычно мужские")
-    ap.add_argument("--max-chars", type=int, default=1000, help="Максимальная длина чанка")
+    ap.add_argument("--max-chars", type=int, default=300, help="Максимальная длина чанка")
     ap.add_argument("--pause-sec", type=float, default=0.025, help="Пауза между чанками")
     args = ap.parse_args()
 

@@ -3,20 +3,27 @@
 from __future__ import annotations
 
 import argparse
+from concurrent.futures import ProcessPoolExecutor, as_completed
 import hashlib
 import json
 import re
 import shutil
 import subprocess
 import sys
+import time
 import xml.etree.ElementTree as ET
 from datetime import datetime
 from pathlib import Path
-from typing import List, Tuple
+from typing import List, Optional, Tuple
+
+from book_tts.num_utils import normalize_yo_to_e
 
 from .chunker import chunk_text_for_vosk
+from .text_utils import replace_numbers_ru
 
 FB2_NS = {"fb": "http://www.gribuser.ru/xml/fictionbook/2.0"}
+_WORKER_MODEL = None
+_WORKER_SYNTH = None
 
 
 def _log(message: str) -> None:
@@ -95,6 +102,7 @@ def extract_fb2_chapters(fb2_path: Path) -> List[Tuple[str, List[str]]]:
 
 def _normalize_for_vosk(text: str) -> str:
     t = text.strip().replace("*", "")
+    t = normalize_yo_to_e(t)
     t = (
         t.replace("«", "")
         .replace("»", "")
@@ -122,7 +130,7 @@ def _strip_unsupported_chars_by_model(text: str, model) -> str:
 def _build_vosk_chunks_from_paragraphs(paragraphs: List[str], max_chars: int) -> List[str]:
     chunks: List[str] = []
     for para in paragraphs:
-        p = para.strip()
+        p = replace_numbers_ru(para.strip())
         if not p:
             continue
         if len(p) <= max_chars:
@@ -167,6 +175,29 @@ def _save_chunks_cache(chapter_work_dir: Path, chunks: List[str], max_chars: int
         encoding="utf-8",
     )
     chunks_txt_path.write_text("\n\n".join(chunks), encoding="utf-8")
+
+
+def _load_json_dict(path: Path) -> Optional[dict]:
+    if not path.exists():
+        return None
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return None
+    if not isinstance(payload, dict):
+        return None
+    return payload
+
+
+def _chunks_hash(chunks: List[str]) -> str:
+    return hashlib.sha1("\n<chunk>\n".join(chunks).encode("utf-8")).hexdigest()
+
+
+def _reset_parts_dir(parts_dir: Path, reason: str) -> None:
+    if parts_dir.exists():
+        shutil.rmtree(parts_dir)
+    parts_dir.mkdir(parents=True, exist_ok=True)
+    _log("reset parts dir: {0}".format(reason))
 
 
 def _write_skip_marker(skip_marker: Path, reason: str, chunk_text: str) -> None:
@@ -280,6 +311,7 @@ def _synthesize_chapter(
     max_chars: int,
     pause_sec: float,
 ) -> Path:
+    chapter_started = time.monotonic()
     chapter_text = "\n\n".join(paragraphs)
     chapter_key = hashlib.sha1((chapter_title + "\n" + chapter_text).encode("utf-8")).hexdigest()[:16]
     chapter_work_dir = work_root / chapter_key
@@ -298,6 +330,7 @@ def _synthesize_chapter(
 
     chunks_json_path = chapter_work_dir / "chunks.json"
     chunks = _load_cached_chunks(chunks_json_path, max_chars=max_chars)
+    chunks_from_cache = bool(chunks)
     if chunks:
         _log("reuse chunks cache: {0}".format(chunks_json_path.name))
     else:
@@ -310,6 +343,22 @@ def _synthesize_chapter(
     _log("start {0}: chunks={1}".format(base_name, len(chunks)))
 
     state_path = chapter_work_dir / "state.json"
+    chunks_hash = _chunks_hash(chunks)
+    old_state = _load_json_dict(state_path)
+    if not chunks_from_cache:
+        _reset_parts_dir(parts_dir, "rebuild chunks cache")
+    elif old_state is not None:
+        old_sig = (
+            old_state.get("speaker_id"),
+            old_state.get("max_chars"),
+            old_state.get("pause_sec"),
+            old_state.get("chunk_count"),
+            old_state.get("chunks_hash"),
+        )
+        new_sig = (speaker_id, max_chars, pause_sec, len(chunks), chunks_hash)
+        if old_sig != new_sig:
+            _reset_parts_dir(parts_dir, "config or chunk signature changed")
+
     state_path.write_text(
         json.dumps(
             {
@@ -318,6 +367,7 @@ def _synthesize_chapter(
                 "speaker_id": speaker_id,
                 "max_chars": max_chars,
                 "pause_sec": pause_sec,
+                "chunks_hash": chunks_hash,
             },
             ensure_ascii=False,
             indent=2,
@@ -327,19 +377,29 @@ def _synthesize_chapter(
 
     parts: List[Path] = []
     for idx, chunk in enumerate(chunks, 1):
+        chunk_started = time.monotonic()
         part_path = parts_dir / "part_{0:05d}.wav".format(idx)
         skip_marker = parts_dir / "part_{0:05d}.skip".format(idx)
+        chunk_label = "chunk {0:05d}/{1:05d}".format(idx, len(chunks))
 
         if skip_marker.exists():
+            elapsed = time.monotonic() - chunk_started
+            _log("  {0} skip-marker ({1:.2f}s)".format(chunk_label, elapsed))
             continue
         if part_path.exists() and part_path.stat().st_size > 0:
             parts.append(part_path)
+            elapsed = time.monotonic() - chunk_started
+            _log("  {0} reuse ({1:.2f}s)".format(chunk_label, elapsed))
             continue
 
         if _save_chunk_wav(synth, model, chunk, part_path, speaker_id):
             parts.append(part_path)
+            elapsed = time.monotonic() - chunk_started
+            _log("  {0} ok ({1:.2f}s)".format(chunk_label, elapsed))
         else:
             _write_skip_marker(skip_marker, "synthesis_failed", chunk)
+            elapsed = time.monotonic() - chunk_started
+            _log("  {0} failed -> .skip ({1:.2f}s)".format(chunk_label, elapsed))
 
     if not parts:
         raise ValueError("Нет озвучиваемых чанков в главе")
@@ -350,8 +410,49 @@ def _synthesize_chapter(
     wav_path.unlink(missing_ok=True)
     if chapter_work_dir.exists():
         shutil.rmtree(chapter_work_dir)
-    _log("done {0}".format(mp3_path.name))
+    chapter_elapsed = time.monotonic() - chapter_started
+    _log("done {0}; chapter_runtime={1:.2f}s".format(mp3_path.name, chapter_elapsed))
     return mp3_path
+
+
+def _worker_init(model_name: str) -> None:
+    global _WORKER_MODEL, _WORKER_SYNTH
+    from vosk_tts import Model, Synth
+
+    _WORKER_MODEL = Model(model_name=model_name)
+    _WORKER_SYNTH = Synth(_WORKER_MODEL)
+
+
+def _process_chapter_task(
+    chapter_idx: int,
+    chapters_total: int,
+    chapter_title: str,
+    paragraphs: List[str],
+    output_dir_str: str,
+    work_root_str: str,
+    speaker_id: int,
+    max_chars: int,
+    pause_sec: float,
+) -> Tuple[int, str, float]:
+    global _WORKER_MODEL, _WORKER_SYNTH
+    if _WORKER_MODEL is None or _WORKER_SYNTH is None:
+        raise RuntimeError("worker model is not initialized")
+
+    started = time.monotonic()
+    _log("[{0}/{1}] {2}".format(chapter_idx, chapters_total, chapter_title))
+    result_path = _synthesize_chapter(
+        model=_WORKER_MODEL,
+        synth=_WORKER_SYNTH,
+        chapter_title=chapter_title,
+        paragraphs=paragraphs,
+        output_dir=Path(output_dir_str),
+        work_root=Path(work_root_str),
+        speaker_id=speaker_id,
+        max_chars=max_chars,
+        pause_sec=pause_sec,
+    )
+    elapsed = time.monotonic() - started
+    return chapter_idx, str(result_path), elapsed
 
 
 def synthesize_fb2_to_mp3_chapters(
@@ -359,36 +460,75 @@ def synthesize_fb2_to_mp3_chapters(
     output_dir: Path,
     model_name: str = "vosk-model-tts-ru-0.9-multi",
     speaker_id: int = 4,
-    max_chars: int = 1000,
+    max_chars: int = 300,
     pause_sec: float = 0.025,
+    workers: int = 1,
 ) -> Path:
-    from vosk_tts import Model, Synth
-
+    total_started = time.monotonic()
     chapters = extract_fb2_chapters(fb2_path)
     if not chapters:
         raise ValueError("Не удалось извлечь главы из FB2")
+    if workers < 1:
+        raise ValueError("workers должен быть >= 1")
 
     output_dir.mkdir(parents=True, exist_ok=True)
     work_root = output_dir / ".vosk_fb2_work"
     work_root.mkdir(parents=True, exist_ok=True)
 
-    model = Model(model_name=model_name)
-    synth = Synth(model)
-
-    _log("chapters={0}, speaker_id={1}, max_chars={2}, pause={3}".format(len(chapters), speaker_id, max_chars, pause_sec))
-    for i, (title, paragraphs) in enumerate(chapters, 1):
-        _log("[{0}/{1}] {2}".format(i, len(chapters), title))
-        _synthesize_chapter(
-            model=model,
-            synth=synth,
-            chapter_title=title,
-            paragraphs=paragraphs,
-            output_dir=output_dir,
-            work_root=work_root,
-            speaker_id=speaker_id,
-            max_chars=max_chars,
-            pause_sec=pause_sec,
+    _log(
+        "chapters={0}, speaker_id={1}, max_chars={2}, pause={3}, workers={4}".format(
+            len(chapters), speaker_id, max_chars, pause_sec, workers
         )
+    )
+    if workers == 1:
+        from vosk_tts import Model, Synth
+
+        model = Model(model_name=model_name)
+        synth = Synth(model)
+        for i, (title, paragraphs) in enumerate(chapters, 1):
+            chapter_started = time.monotonic()
+            _log("[{0}/{1}] {2}".format(i, len(chapters), title))
+            _synthesize_chapter(
+                model=model,
+                synth=synth,
+                chapter_title=title,
+                paragraphs=paragraphs,
+                output_dir=output_dir,
+                work_root=work_root,
+                speaker_id=speaker_id,
+                max_chars=max_chars,
+                pause_sec=pause_sec,
+            )
+            chapter_elapsed = time.monotonic() - chapter_started
+            _log("[{0}/{1}] runtime={2:.2f}s".format(i, len(chapters), chapter_elapsed))
+    else:
+        tasks = []
+        with ProcessPoolExecutor(
+            max_workers=workers,
+            initializer=_worker_init,
+            initargs=(model_name,),
+        ) as ex:
+            for i, (title, paragraphs) in enumerate(chapters, 1):
+                fut = ex.submit(
+                    _process_chapter_task,
+                    i,
+                    len(chapters),
+                    title,
+                    paragraphs,
+                    str(output_dir),
+                    str(work_root),
+                    speaker_id,
+                    max_chars,
+                    pause_sec,
+                )
+                tasks.append(fut)
+
+            for fut in as_completed(tasks):
+                idx, result_path, chapter_elapsed = fut.result()
+                _log("[{0}/{1}] runtime={2:.2f}s -> {3}".format(idx, len(chapters), chapter_elapsed, Path(result_path).name))
+
+    total_elapsed = time.monotonic() - total_started
+    _log("all done; total_runtime={0:.2f}s".format(total_elapsed))
 
     return output_dir
 
@@ -399,8 +539,9 @@ def main() -> None:
     ap.add_argument("-o", "--output-dir", help="Папка для MP3 глав")
     ap.add_argument("--model", default="vosk-model-tts-ru-0.9-multi", help="Название модели vosk-tts")
     ap.add_argument("--speaker-id", type=int, default=4, help="speaker_id (0..4)")
-    ap.add_argument("--max-chars", type=int, default=1000, help="Лимит символов на чанк")
+    ap.add_argument("--max-chars", type=int, default=300, help="Лимит символов на чанк")
     ap.add_argument("--pause-sec", type=float, default=0.025, help="Пауза между чанками")
+    ap.add_argument("--workers", type=int, default=1, help="Количество параллельных воркеров по главам")
     args = ap.parse_args()
 
     inp = Path(args.input)
@@ -418,6 +559,7 @@ def main() -> None:
             speaker_id=args.speaker_id,
             max_chars=args.max_chars,
             pause_sec=args.pause_sec,
+            workers=args.workers,
         )
     except ET.ParseError as exc:
         sys.exit("Некорректный FB2/XML: {0}".format(exc))

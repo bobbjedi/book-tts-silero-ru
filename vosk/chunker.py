@@ -107,7 +107,7 @@ def _split_sentences_balanced(sentences: List[str], max_chars: int) -> List[str]
     return out
 
 
-def chunk_text_for_vosk(text: str, max_chars: int = 1000) -> List[str]:
+def chunk_text_for_vosk(text: str, max_chars: int = 250) -> List[str]:
     """
     Режет текст на чанки:
     - сначала по предложениям;
