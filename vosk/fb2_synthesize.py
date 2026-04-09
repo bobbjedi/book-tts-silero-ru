@@ -1,0 +1,431 @@
+"""Озвучка FB2 по главам через vosk-tts."""
+
+from __future__ import annotations
+
+import argparse
+import hashlib
+import json
+import re
+import shutil
+import subprocess
+import sys
+import xml.etree.ElementTree as ET
+from datetime import datetime
+from pathlib import Path
+from typing import List, Tuple
+
+from .chunker import chunk_text_for_vosk
+
+FB2_NS = {"fb": "http://www.gribuser.ru/xml/fictionbook/2.0"}
+
+
+def _log(message: str) -> None:
+    ts = datetime.now().strftime("%H:%M:%S")
+    print("[{0}] {1}".format(ts, message), flush=True)
+
+
+def _safe_name(name: str, max_len: int = 120) -> str:
+    s = re.sub(r"\s+", " ", name).strip()
+    s = re.sub(r"[\\/:*?\"<>|]", "_", s)
+    s = s.strip(". ")
+    if not s:
+        s = "chapter"
+    return s[:max_len].rstrip(". ")
+
+
+def _short_chapter_title(title: str) -> str:
+    t = re.sub(r"\s+", " ", title).strip()
+    m = re.search(r"(глава\s+\d+)\s*[:.]?\s*(.*)$", t, flags=re.IGNORECASE)
+    if not m:
+        return t
+    head = m.group(1).title()
+    tail = m.group(2).strip()
+    return "{0} {1}".format(head, tail).strip()
+
+
+def _extract_title(section: ET.Element) -> str:
+    title_node = section.find("fb:title", FB2_NS)
+    if title_node is None:
+        return ""
+    parts: List[str] = []
+    for p in title_node.findall("fb:p", FB2_NS):
+        txt = "".join(p.itertext()).strip()
+        if txt:
+            parts.append(txt)
+    return " ".join(parts).strip()
+
+
+def _extract_section_paragraphs(section: ET.Element) -> List[str]:
+    paragraphs: List[str] = []
+    for p in section.findall(".//fb:p", FB2_NS):
+        txt = "".join(p.itertext()).strip()
+        if txt:
+            paragraphs.append(txt)
+    return paragraphs
+
+
+def extract_fb2_chapters(fb2_path: Path) -> List[Tuple[str, List[str]]]:
+    tree = ET.parse(str(fb2_path))
+    root = tree.getroot()
+
+    bodies = root.findall("fb:body", FB2_NS)
+    if not bodies:
+        return []
+
+    main_body = bodies[0]
+    top_sections = main_body.findall("fb:section", FB2_NS)
+
+    chapters: List[Tuple[str, List[str]]] = []
+    for idx, section in enumerate(top_sections, 1):
+        title = _extract_title(section) or "Глава {0}".format(idx)
+        paragraphs = _extract_section_paragraphs(section)
+        if paragraphs:
+            chapters.append((title, paragraphs))
+
+    if chapters:
+        return chapters
+
+    body_paras: List[str] = []
+    for p in main_body.findall(".//fb:p", FB2_NS):
+        txt = "".join(p.itertext()).strip()
+        if txt:
+            body_paras.append(txt)
+    return [("Книга", body_paras)] if body_paras else []
+
+
+def _normalize_for_vosk(text: str) -> str:
+    t = text.strip().replace("*", "")
+    t = (
+        t.replace("«", "")
+        .replace("»", "")
+        .replace('"', "")
+        .replace("„", "")
+        .replace("“", "")
+        .replace("”", "")
+        .replace("‘", "")
+        .replace("’", "")
+        .replace("—", "-")
+        .replace("–", "-")
+    )
+    return re.sub(r"\s+", " ", t).strip()
+
+
+def _strip_unsupported_chars_by_model(text: str, model) -> str:
+    symbols = model.config.get("phoneme_id_map", {})
+    allowed = set(symbols.keys())
+    if not allowed:
+        return text
+    cleaned = "".join(ch for ch in text.lower() if ch in allowed or ch.isspace())
+    return re.sub(r"\s+", " ", cleaned).strip()
+
+
+def _build_vosk_chunks_from_paragraphs(paragraphs: List[str], max_chars: int) -> List[str]:
+    chunks: List[str] = []
+    for para in paragraphs:
+        p = para.strip()
+        if not p:
+            continue
+        if len(p) <= max_chars:
+            chunks.append(p)
+        else:
+            chunks.extend(chunk_text_for_vosk(p, max_chars=max_chars))
+    return chunks
+
+
+def _load_cached_chunks(chunks_json_path: Path, max_chars: int) -> List[str]:
+    if not chunks_json_path.exists():
+        return []
+    try:
+        payload = json.loads(chunks_json_path.read_text(encoding="utf-8"))
+    except Exception:
+        return []
+
+    if not isinstance(payload, dict):
+        return []
+    if int(payload.get("max_chars", -1)) != max_chars:
+        return []
+    chunks = payload.get("chunks")
+    if not isinstance(chunks, list):
+        return []
+    clean = [str(x).strip() for x in chunks if str(x).strip()]
+    return clean
+
+
+def _save_chunks_cache(chapter_work_dir: Path, chunks: List[str], max_chars: int) -> None:
+    chunks_json_path = chapter_work_dir / "chunks.json"
+    chunks_txt_path = chapter_work_dir / "chunks.txt"
+    chunks_json_path.write_text(
+        json.dumps(
+            {
+                "max_chars": max_chars,
+                "chunk_count": len(chunks),
+                "chunks": chunks,
+            },
+            ensure_ascii=False,
+            indent=2,
+        ),
+        encoding="utf-8",
+    )
+    chunks_txt_path.write_text("\n\n".join(chunks), encoding="utf-8")
+
+
+def _write_skip_marker(skip_marker: Path, reason: str, chunk_text: str) -> None:
+    payload = {
+        "reason": reason,
+        "chunk_text": chunk_text,
+    }
+    skip_marker.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def _probe_sample_rate(wav_path: Path) -> int:
+    out = subprocess.run(
+        [
+            "ffprobe",
+            "-v",
+            "error",
+            "-select_streams",
+            "a:0",
+            "-show_entries",
+            "stream=sample_rate",
+            "-of",
+            "default=nokey=1:noprint_wrappers=1",
+            str(wav_path),
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    return int(out.stdout.strip())
+
+
+def _generate_silence_wav(path: Path, duration_sec: float, sample_rate: int) -> None:
+    subprocess.run(
+        [
+            "ffmpeg",
+            "-y",
+            "-f",
+            "lavfi",
+            "-i",
+            "anullsrc=r={0}:cl=mono".format(sample_rate),
+            "-t",
+            str(duration_sec),
+            "-c:a",
+            "pcm_s16le",
+            str(path),
+        ],
+        check=True,
+        capture_output=True,
+    )
+
+
+def _concat_wavs(parts: List[Path], out_path: Path, tmp_dir: Path, pause_sec: float, sample_rate: int) -> None:
+    if not parts:
+        raise ValueError("Нет частей для склейки")
+
+    list_file = tmp_dir / "concat_list.txt"
+    silence = None
+    if pause_sec > 0 and len(parts) > 1:
+        silence = tmp_dir / "silence.wav"
+        _generate_silence_wav(silence, pause_sec, sample_rate)
+
+    lines: List[str] = []
+    for idx, part in enumerate(parts):
+        lines.append("file '{0}'\n".format(part.resolve().as_posix()))
+        if silence is not None and idx != len(parts) - 1:
+            lines.append("file '{0}'\n".format(silence.resolve().as_posix()))
+
+    list_file.write_text("".join(lines), encoding="utf-8")
+    subprocess.run(
+        ["ffmpeg", "-y", "-f", "concat", "-safe", "0", "-i", str(list_file), "-c", "copy", str(out_path)],
+        check=True,
+        capture_output=True,
+    )
+
+
+def _wav_to_mp3(wav_path: Path, mp3_path: Path, bitrate: str = "192k") -> None:
+    subprocess.run(
+        ["ffmpeg", "-y", "-i", str(wav_path), "-codec:a", "libmp3lame", "-b:a", bitrate, str(mp3_path)],
+        check=True,
+        capture_output=True,
+    )
+
+
+def _save_chunk_wav(synth, model, chunk_text: str, part_path: Path, speaker_id: int) -> bool:
+    prepared = _normalize_for_vosk(chunk_text)
+    if not prepared:
+        return False
+    try:
+        synth.synth(prepared, str(part_path), speaker_id=speaker_id)
+        return True
+    except Exception as exc:
+        safe = _strip_unsupported_chars_by_model(prepared, model)
+        if safe and safe != prepared:
+            try:
+                synth.synth(safe, str(part_path), speaker_id=speaker_id)
+                return True
+            except Exception as exc2:
+                _log("  sanitized retry failed: {0}".format(exc2))
+        _log("  chunk failed permanently: {0}".format(exc))
+        return False
+
+
+def _synthesize_chapter(
+    model,
+    synth,
+    chapter_title: str,
+    paragraphs: List[str],
+    output_dir: Path,
+    work_root: Path,
+    speaker_id: int,
+    max_chars: int,
+    pause_sec: float,
+) -> Path:
+    chapter_text = "\n\n".join(paragraphs)
+    chapter_key = hashlib.sha1((chapter_title + "\n" + chapter_text).encode("utf-8")).hexdigest()[:16]
+    chapter_work_dir = work_root / chapter_key
+    parts_dir = chapter_work_dir / "parts"
+    parts_dir.mkdir(parents=True, exist_ok=True)
+
+    short_title = _short_chapter_title(chapter_title)
+    safe_title = _safe_name(short_title)
+    base_name = safe_title
+    wav_path = output_dir / "{0}.wav".format(base_name)
+    mp3_path = output_dir / "{0}.mp3".format(base_name)
+
+    if mp3_path.exists() and mp3_path.stat().st_size > 0:
+        _log("skip existing {0}".format(mp3_path.name))
+        return mp3_path
+
+    chunks_json_path = chapter_work_dir / "chunks.json"
+    chunks = _load_cached_chunks(chunks_json_path, max_chars=max_chars)
+    if chunks:
+        _log("reuse chunks cache: {0}".format(chunks_json_path.name))
+    else:
+        chunks = _build_vosk_chunks_from_paragraphs(paragraphs, max_chars=max_chars)
+        if chunks:
+            _save_chunks_cache(chapter_work_dir, chunks, max_chars=max_chars)
+
+    if not chunks:
+        raise ValueError("Пустой набор чанков в главе")
+    _log("start {0}: chunks={1}".format(base_name, len(chunks)))
+
+    state_path = chapter_work_dir / "state.json"
+    state_path.write_text(
+        json.dumps(
+            {
+                "chapter_title": chapter_title,
+                "chunk_count": len(chunks),
+                "speaker_id": speaker_id,
+                "max_chars": max_chars,
+                "pause_sec": pause_sec,
+            },
+            ensure_ascii=False,
+            indent=2,
+        ),
+        encoding="utf-8",
+    )
+
+    parts: List[Path] = []
+    for idx, chunk in enumerate(chunks, 1):
+        part_path = parts_dir / "part_{0:05d}.wav".format(idx)
+        skip_marker = parts_dir / "part_{0:05d}.skip".format(idx)
+
+        if skip_marker.exists():
+            continue
+        if part_path.exists() and part_path.stat().st_size > 0:
+            parts.append(part_path)
+            continue
+
+        if _save_chunk_wav(synth, model, chunk, part_path, speaker_id):
+            parts.append(part_path)
+        else:
+            _write_skip_marker(skip_marker, "synthesis_failed", chunk)
+
+    if not parts:
+        raise ValueError("Нет озвучиваемых чанков в главе")
+
+    sample_rate = _probe_sample_rate(parts[0])
+    _concat_wavs(parts, wav_path, chapter_work_dir, pause_sec, sample_rate)
+    _wav_to_mp3(wav_path, mp3_path)
+    wav_path.unlink(missing_ok=True)
+    if chapter_work_dir.exists():
+        shutil.rmtree(chapter_work_dir)
+    _log("done {0}".format(mp3_path.name))
+    return mp3_path
+
+
+def synthesize_fb2_to_mp3_chapters(
+    fb2_path: Path,
+    output_dir: Path,
+    model_name: str = "vosk-model-tts-ru-0.9-multi",
+    speaker_id: int = 4,
+    max_chars: int = 1000,
+    pause_sec: float = 0.025,
+) -> Path:
+    from vosk_tts import Model, Synth
+
+    chapters = extract_fb2_chapters(fb2_path)
+    if not chapters:
+        raise ValueError("Не удалось извлечь главы из FB2")
+
+    output_dir.mkdir(parents=True, exist_ok=True)
+    work_root = output_dir / ".vosk_fb2_work"
+    work_root.mkdir(parents=True, exist_ok=True)
+
+    model = Model(model_name=model_name)
+    synth = Synth(model)
+
+    _log("chapters={0}, speaker_id={1}, max_chars={2}, pause={3}".format(len(chapters), speaker_id, max_chars, pause_sec))
+    for i, (title, paragraphs) in enumerate(chapters, 1):
+        _log("[{0}/{1}] {2}".format(i, len(chapters), title))
+        _synthesize_chapter(
+            model=model,
+            synth=synth,
+            chapter_title=title,
+            paragraphs=paragraphs,
+            output_dir=output_dir,
+            work_root=work_root,
+            speaker_id=speaker_id,
+            max_chars=max_chars,
+            pause_sec=pause_sec,
+        )
+
+    return output_dir
+
+
+def main() -> None:
+    ap = argparse.ArgumentParser(description="Vosk TTS: FB2 -> MP3 (по главам)")
+    ap.add_argument("input", help="Входной .fb2")
+    ap.add_argument("-o", "--output-dir", help="Папка для MP3 глав")
+    ap.add_argument("--model", default="vosk-model-tts-ru-0.9-multi", help="Название модели vosk-tts")
+    ap.add_argument("--speaker-id", type=int, default=4, help="speaker_id (0..4)")
+    ap.add_argument("--max-chars", type=int, default=1000, help="Лимит символов на чанк")
+    ap.add_argument("--pause-sec", type=float, default=0.025, help="Пауза между чанками")
+    args = ap.parse_args()
+
+    inp = Path(args.input)
+    if not inp.exists():
+        sys.exit("Нет файла: {0}".format(inp))
+    if inp.suffix.lower() != ".fb2":
+        sys.exit("Ожидается .fb2")
+
+    out_dir = Path(args.output_dir) if args.output_dir else inp.with_name("{0}_vosk_mp3".format(inp.stem))
+    try:
+        result = synthesize_fb2_to_mp3_chapters(
+            fb2_path=inp,
+            output_dir=out_dir,
+            model_name=args.model,
+            speaker_id=args.speaker_id,
+            max_chars=args.max_chars,
+            pause_sec=args.pause_sec,
+        )
+    except ET.ParseError as exc:
+        sys.exit("Некорректный FB2/XML: {0}".format(exc))
+    except Exception as exc:
+        sys.exit("Ошибка: {0}".format(exc))
+
+    print("Готово: {0}".format(result))
+
+
+if __name__ == "__main__":
+    main()
