@@ -15,6 +15,7 @@ ChunkType = Literal["author", "line", "question", "exclamation"]
 # Поддерживаемые значения Silero SSML (prosody).
 SUPPORTED_RATE_VALUES = ("x-slow", "slow", "medium", "fast", "x-fast")
 SUPPORTED_PITCH_VALUES = ("x-low", "low", "medium", "high", "x-high")
+DEFAULT_MAX_CHARS = 850
 
 DEFAULT_PROFILES: Dict[ChunkType, Dict[str, str]] = {
     "line": {"pitch": "high", "rate": "medium"},
@@ -40,6 +41,7 @@ class Chunk:
 def parse_book_text(
     text: str,
     profiles: Optional[Dict[ChunkType, Dict[str, str]]] = None,
+    max_chars: int = DEFAULT_MAX_CHARS,
 ) -> List[Chunk]:
     """Разбирает текст книги в последовательность чанков."""
     cfg = profiles or DEFAULT_PROFILES
@@ -49,12 +51,13 @@ def parse_book_text(
     chunks: List[Chunk] = []
     for paragraph in paragraphs:
         chunks.extend(_parse_paragraph(paragraph, cfg))
-    return chunks
+    return _enforce_max_chunk_size(chunks, cfg, max_chars)
 
 
 def parse_text_file(
     input_path: str,
     profiles: Optional[Dict[ChunkType, Dict[str, str]]] = None,
+    max_chars: int = DEFAULT_MAX_CHARS,
 ) -> Tuple[Path, Path]:
     """
     Парсит .txt и ОБЯЗАТЕЛЬНО пишет 2 файла рядом:
@@ -63,7 +66,7 @@ def parse_text_file(
     """
     src = Path(input_path)
     text = src.read_text(encoding="utf-8")
-    chunks = parse_book_text(text, profiles=profiles)
+    chunks = parse_book_text(text, profiles=profiles, max_chars=max_chars)
 
     json_path = src.with_name("{0}.parsed.json".format(src.stem))
     chunks_path = src.with_name("{0}.chunks.txt".format(src.stem))
@@ -130,6 +133,101 @@ def _speech_to_chunks(
         else:
             ssml = _build_ssml(sentence, profiles[kind])
         out.append(Chunk(type=kind, text=sentence, ssml=ssml))
+    return out
+
+
+def _enforce_max_chunk_size(
+    chunks: List[Chunk],
+    profiles: Dict[ChunkType, Dict[str, str]],
+    max_chars: int,
+) -> List[Chunk]:
+    if max_chars <= 0:
+        return chunks
+
+    out: List[Chunk] = []
+    for chunk in chunks:
+        if len(chunk.text) <= max_chars:
+            out.append(chunk)
+            continue
+        out.extend(_split_chunk(chunk, profiles, max_chars))
+    return out
+
+
+def _split_chunk(
+    chunk: Chunk,
+    profiles: Dict[ChunkType, Dict[str, str]],
+    max_chars: int,
+) -> List[Chunk]:
+    pieces = _split_text_to_max(chunk.text, max_chars)
+    if len(pieces) <= 1:
+        return [chunk]
+
+    if chunk.type == "author":
+        return [_make_author_chunk(piece) for piece in pieces]
+
+    split_result: List[Chunk] = []
+    for piece in pieces:
+        split_result.extend(_speech_to_chunks(piece, profiles))
+    return split_result
+
+
+def _split_text_to_max(text: str, max_chars: int) -> List[str]:
+    normalized = _compact_ws(text)
+    if len(normalized) <= max_chars:
+        return [normalized]
+
+    sentences = [s.strip() for s in re.split(r"(?<=[.!?…])\s+", normalized) if s.strip()]
+    if not sentences:
+        return _split_sentence_by_words(normalized, max_chars)
+
+    pieces: List[str] = []
+    buf = ""
+    for sentence in sentences:
+        if len(sentence) > max_chars:
+            if buf:
+                pieces.append(buf)
+                buf = ""
+            pieces.extend(_split_sentence_by_words(sentence, max_chars))
+            continue
+
+        candidate = sentence if not buf else "{0} {1}".format(buf, sentence)
+        if len(candidate) <= max_chars:
+            buf = candidate
+        else:
+            pieces.append(buf)
+            buf = sentence
+
+    if buf:
+        pieces.append(buf)
+    return pieces
+
+
+def _split_sentence_by_words(sentence: str, max_chars: int) -> List[str]:
+    words = sentence.split()
+    if not words:
+        return []
+
+    out: List[str] = []
+    buf = ""
+    for word in words:
+        candidate = word if not buf else "{0} {1}".format(buf, word)
+        if len(candidate) <= max_chars:
+            buf = candidate
+            continue
+
+        if buf:
+            out.append(buf)
+            buf = ""
+
+        if len(word) <= max_chars:
+            buf = word
+            continue
+
+        for i in range(0, len(word), max_chars):
+            out.append(word[i : i + max_chars])
+
+    if buf:
+        out.append(buf)
     return out
 
 
@@ -319,9 +417,10 @@ def int_to_words_ru(number: int) -> str:
 def main() -> None:
     ap = argparse.ArgumentParser(description="Парсер книги в JSON + chunks debug")
     ap.add_argument("input", help="Входной .txt файл")
+    ap.add_argument("--max-chars", type=int, default=DEFAULT_MAX_CHARS, help="Макс. длина чанка в символах")
     args = ap.parse_args()
 
-    json_path, chunks_path = parse_text_file(args.input)
+    json_path, chunks_path = parse_text_file(args.input, max_chars=args.max_chars)
     print(json_path)
     print(chunks_path)
 

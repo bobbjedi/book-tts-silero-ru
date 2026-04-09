@@ -6,3 +6,5 @@ __pycache__/
 !tests/test*.txt
 *.chunks.txt
 *.json
+*.wav
+*.mp3
