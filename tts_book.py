@@ -16,6 +16,7 @@ MAX_CHUNK = 3000
 
 PROSODY = {
     "narration":    {"pitch": "-2Hz",  "rate_offset": -15},
+    "author":       {"pitch": "-2Hz",  "rate_offset": -15},
     "dialogue":     {"pitch": "+5Hz",  "rate_offset": +5},
     "question":     {"pitch": "+7Hz",  "rate_offset": +7},
     "exclamation":  {"pitch": "+12Hz", "rate_offset": +40},
@@ -25,6 +26,7 @@ PROSODY = {
 
 LABELS = {
     "narration": "описание",
+    "author": "автор",
     "dialogue": "реплика",
     "question": "вопрос",
     "exclamation": "восклицание",
@@ -36,6 +38,12 @@ LABELS = {
 class Segment:
     text: str
     seg_type: str
+
+
+@dataclass
+class Paragraph:
+    raw_text: str
+    segments: list[Segment]
 
 
 def _classify_text(text: str, is_speech: bool = False) -> str:
@@ -53,7 +61,9 @@ def _classify_text(text: str, is_speech: bool = False) -> str:
 def _split_dialogue_line(line: str) -> list[Segment]:
     """Разбивает '— реплика — ремарка — реплика' на сегменты."""
     stripped = re.sub(r'^[—–\-]\s*', '', line.strip())
-    parts = re.split(r'\s*—\s*', stripped)
+    # Диалоговые разделители бывают '—' или '-' (как в некоторых книгах/переводах).
+    # Для '-' режем только если он окружён пробелами, чтобы не ломать дефисы в словах.
+    parts = [p for p in re.split(r'\s*[—–]\s*|\s+-\s+', stripped) if p is not None]
 
     if len(parts) == 1:
         return [Segment(parts[0], _classify_text(parts[0], is_speech=True))]
@@ -82,7 +92,7 @@ def _split_dialogue_line(line: str) -> list[Segment]:
         if is_speech:
             segments.append(Segment(text, _classify_text(text, is_speech=True)))
         else:
-            segments.append(Segment(text, "narration"))
+            segments.append(Segment(text, "author"))
     return segments
 
 
@@ -108,6 +118,26 @@ def parse_segments(text: str) -> list[Segment]:
     return segments
 
 
+def parse_paragraphs(text: str) -> list[Paragraph]:
+    """Парсит абзацы, сохраняя и raw-текст, и сегменты для логов."""
+    paragraphs = re.split(r'\n\s*\n', text.strip())
+    out: list[Paragraph] = []
+    for para in paragraphs:
+        para = para.strip()
+        if not para:
+            continue
+        segs: list[Segment] = []
+        lines = [ln.strip() for ln in para.split('\n') if ln.strip()]
+        for line in lines:
+            if re.match(r'^[—–\-]', line):
+                segs.extend(_split_dialogue_line(line))
+            else:
+                segs.append(Segment(line, _classify_text(line)))
+        raw = "\n".join(lines)
+        out.append(Paragraph(raw_text=raw, segments=segs))
+    return out
+
+
 def split_long_segment(seg: Segment, max_len: int = MAX_CHUNK) -> list[Segment]:
     if len(seg.text) <= max_len:
         return [seg]
@@ -126,12 +156,18 @@ def split_long_segment(seg: Segment, max_len: int = MAX_CHUNK) -> list[Segment]:
     return parts
 
 
+def _strip_stars(s: str) -> str:
+    """Edge не озвучивает * адекватно — убираем из текста."""
+    return s.replace("*", "")
+
+
 async def synthesize_segment(seg: Segment, voice: str, output: str,
                               base_rate: int, volume: str, retries: int = 3):
     p = PROSODY.get(seg.seg_type, PROSODY["narration"])
     rate = f"{base_rate + p['rate_offset']:+d}%"
     pitch = p["pitch"]
-    text = re.sub(r'[?!]{2,}', '!', seg.text) if seg.seg_type == "qexclaim" else seg.text
+    raw = _strip_stars(seg.text)
+    text = re.sub(r'[?!]{2,}', '!', raw) if seg.seg_type == "qexclaim" else raw
     for attempt in range(retries):
         try:
             comm = edge_tts.Communicate(text, voice, rate=rate, volume=volume, pitch=pitch)
@@ -165,6 +201,17 @@ async def main():
     parser.add_argument("-r", "--rate", default="+0%",
                         help="Базовая скорость, напр. +30%% = 1.3x (по умолчанию +0%%)")
     parser.add_argument("--volume", default="+0%", help="Громкость, напр. +50%%")
+    parser.add_argument(
+        "--batch",
+        choices=["segments", "paragraphs"],
+        default="paragraphs",
+        help="Как отправлять в TTS: segments (много запросов) или paragraphs (1 запрос на абзац)",
+    )
+    parser.add_argument(
+        "--log-full",
+        action="store_true",
+        help="Печатать полный текст каждого отправленного куска (иначе только превью)",
+    )
     parser.add_argument("--list-voices", action="store_true",
                         help="Показать доступные голоса")
     args = parser.parse_args()
@@ -186,13 +233,28 @@ async def main():
     output_path = Path(args.output) if args.output else input_path.with_suffix(".mp3")
     base_rate = int(re.match(r'([+-]?\d+)', args.rate).group(1))
 
-    segments = parse_segments(text)
-    flat: list[Segment] = []
-    for seg in segments:
-        if seg.seg_type == "pause":
-            flat.append(seg)
-        else:
-            flat.extend(split_long_segment(seg))
+    paragraphs = parse_paragraphs(text)
+    log_segments: list[Segment] = []
+    for i, p in enumerate(paragraphs):
+        if i > 0:
+            log_segments.append(Segment("", "pause"))
+        log_segments.extend(p.segments)
+
+    if args.batch == "segments":
+        flat: list[Segment] = []
+        for seg in log_segments:
+            if seg.seg_type == "pause":
+                flat.append(seg)
+            else:
+                flat.extend(split_long_segment(seg))
+    else:
+        # Синтезируем 1 запрос на абзац (разметка — только в логах).
+        flat = []
+        for i, p in enumerate(paragraphs):
+            if i > 0:
+                flat.append(Segment("", "pause"))
+            # Важно: оставляем переносы строк — они помогают паузам внутри абзаца.
+            flat.append(Segment(p.raw_text, "narration"))
 
     temp_dir = input_path.parent / ".tts_tmp"
     temp_dir.mkdir(exist_ok=True)
@@ -217,8 +279,14 @@ async def main():
             audio_idx += 1
             p = temp_dir / f"part_{i:04d}.mp3"
             label = LABELS.get(seg.seg_type, seg.seg_type)
-            preview = seg.text[:80] + ("..." if len(seg.text) > 80 else "")
-            print(f"  [{audio_idx}/{total_audio}] [{label}]: {preview}")
+            to_print = seg.text if args.log_full else (seg.text[:80] + ("..." if len(seg.text) > 80 else ""))
+            if args.batch == "paragraphs":
+                # Печатаем подробную разметку для проверки
+                print(f"  [{audio_idx}/{total_audio}] [абзац]: {to_print}")
+                # Покажем сегменты этого абзаца (валидируем разметку глазами)
+                # (по индексу аудио мы не всегда можем восстановить абзац, поэтому печатаем всё заранее ниже)
+            else:
+                print(f"  [{audio_idx}/{total_audio}] [{label}]: {to_print}")
             await synthesize_segment(seg, args.voice, str(p), base_rate, args.volume)
             part_files.append(p)
 
@@ -231,6 +299,18 @@ async def main():
 
     size_mb = output_path.stat().st_size / (1024 * 1024)
     print(f"Готово: {output_path} ({size_mb:.1f} МБ)")
+
+    # Вывод разметки после синтеза (чтобы не мешать прогрессу)
+    if args.batch == "paragraphs":
+        print("\nРазметка (для проверки):")
+        total = len([s for s in log_segments if s.seg_type != "pause"])
+        idx = 0
+        for seg in log_segments:
+            if seg.seg_type == "pause":
+                continue
+            idx += 1
+            label = LABELS.get(seg.seg_type, seg.seg_type)
+            print(f"[{label}]: {seg.text}")
 
 
 if __name__ == "__main__":
