@@ -18,7 +18,7 @@ from .text_utils import replace_numbers_ru
 
 def _normalize_for_vosk(text: str) -> str:
     t = text.strip().replace("*", "")
-    t = normalize_yo_to_e(t)
+    # ё оставляем — без неё сеть читает «всЕ» вместо «всЁ»
     t = (
         t.replace("«", "")
         .replace("»", "")

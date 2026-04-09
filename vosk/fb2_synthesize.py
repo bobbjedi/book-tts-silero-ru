@@ -102,7 +102,7 @@ def extract_fb2_chapters(fb2_path: Path) -> List[Tuple[str, List[str]]]:
 
 def _normalize_for_vosk(text: str) -> str:
     t = text.strip().replace("*", "")
-    t = normalize_yo_to_e(t)
+    # ё оставляем — без неё сеть читает «всЕ» вместо «всЁ»
     t = (
         t.replace("«", "")
         .replace("»", "")
