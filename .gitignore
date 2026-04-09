@@ -2,3 +2,7 @@
 .tts_tmp/
 __pycache__/
 .venv/
+.txt 
+!tests/test*.txt
+*.chunks.txt
+*.json

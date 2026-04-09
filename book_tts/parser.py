@@ -1,0 +1,313 @@
+"""Парсер художественного текста в чанки для TTS."""
+
+from __future__ import annotations
+
+import argparse
+import html
+import json
+import re
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Dict, List, Literal, Optional, Tuple
+
+ChunkType = Literal["author", "line", "question", "exclamation"]
+
+DEFAULT_PROFILES: Dict[ChunkType, Dict[str, str]] = {
+    "line": {"pitch": "+2%", "rate": "+1%"},
+    "exclamation": {"pitch": "+4%", "rate": "+2%"},
+    "question": {"pitch": "+7%", "rate": "+2%"},
+    "author": {},
+}
+
+
+@dataclass
+class Chunk:
+    type: ChunkType
+    text: str
+    ssml: Optional[str] = None
+
+    def to_dict(self) -> Dict[str, str]:
+        data = {"type": self.type, "text": self.text}
+        if self.ssml is not None:
+            data["ssml"] = self.ssml
+        return data
+
+
+def parse_book_text(
+    text: str,
+    profiles: Optional[Dict[ChunkType, Dict[str, str]]] = None,
+) -> List[Chunk]:
+    """Разбирает текст книги в последовательность чанков."""
+    cfg = profiles or DEFAULT_PROFILES
+    prepared = _replace_numbers(_normalize_global(text))
+    paragraphs = [p.strip() for p in re.split(r"\n\s*\n", prepared) if p.strip()]
+
+    chunks: List[Chunk] = []
+    for paragraph in paragraphs:
+        chunks.extend(_parse_paragraph(paragraph, cfg))
+    return chunks
+
+
+def parse_text_file(
+    input_path: str,
+    profiles: Optional[Dict[ChunkType, Dict[str, str]]] = None,
+) -> Tuple[Path, Path]:
+    """
+    Парсит .txt и ОБЯЗАТЕЛЬНО пишет 2 файла рядом:
+    - <name>.parsed.json
+    - <name>.chunks.txt
+    """
+    src = Path(input_path)
+    text = src.read_text(encoding="utf-8")
+    chunks = parse_book_text(text, profiles=profiles)
+
+    json_path = src.with_name("{0}.parsed.json".format(src.stem))
+    chunks_path = src.with_name("{0}.chunks.txt".format(src.stem))
+
+    payload = [chunk.to_dict() for chunk in chunks]
+    json_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+
+    lines = ["[{0}]: {1}".format(chunk.type, chunk.text) for chunk in chunks]
+    chunks_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    return json_path, chunks_path
+
+
+def _parse_paragraph(
+    paragraph: str,
+    profiles: Dict[ChunkType, Dict[str, str]],
+) -> List[Chunk]:
+    p = _compact_ws(paragraph)
+    if not p.startswith("-"):
+        return [_make_author_chunk(p)]
+
+    body = p[1:].strip()
+    parts = [part.strip() for part in re.split(r"\s+-\s+", body) if part.strip()]
+
+    chunks: List[Chunk] = []
+    speech_buffer: List[str] = []
+    for part in parts:
+        if _looks_like_author_remark(part):
+            if speech_buffer:
+                chunks.extend(_speech_to_chunks(" - ".join(speech_buffer), profiles))
+                speech_buffer = []
+            chunks.append(_make_author_chunk(part))
+        else:
+            speech_buffer.append(part)
+
+    if speech_buffer:
+        chunks.extend(_speech_to_chunks(" - ".join(speech_buffer), profiles))
+    return chunks
+
+
+def _speech_to_chunks(
+    text: str,
+    profiles: Dict[ChunkType, Dict[str, str]],
+) -> List[Chunk]:
+    normalized = _ensure_terminal_punctuation(_compact_ws(text))
+    sentences = [s.strip() for s in re.split(r"(?<=[.!?…])\s+", normalized) if s.strip()]
+
+    out: List[Chunk] = []
+    for sentence in sentences:
+        sentence = _ensure_terminal_punctuation(_capitalize_first(sentence))
+        kind = _detect_kind(sentence)
+        if kind == "question":
+            sentence = _mark_last_word_in_question(sentence)
+        # Склеиваем подряд идущие line/exclamation в один чанк.
+        if out and out[-1].type == kind and kind != "question":
+            merged_text = "{0} {1}".format(out[-1].text, sentence)
+            out[-1].text = merged_text
+            out[-1].ssml = _build_ssml(merged_text, profiles[kind])
+            continue
+        ssml = _build_ssml(sentence, profiles[kind])
+        out.append(Chunk(type=kind, text=sentence, ssml=ssml))
+    return out
+
+
+def _looks_like_author_remark(text: str) -> bool:
+    t = _compact_ws(text).lower()
+    verb_core = (
+        r"сказал(?:а|о|и)?|"
+        r"спросил(?:а|о|и)?|"
+        r"ответил(?:а|о|и)?|"
+        r"заметил(?:а|о|и)?|"
+        r"добавил(?:а|о|и)?|"
+        r"произнес(?:ла|ли)?|произн[её]с(?:ла|ли)?|"
+        r"прошептал(?:а|о|и)?|"
+        r"крикнул(?:а|о|и)?|"
+        r"раздал(?:ся|ась|ось|ись)|"
+        r"ухмыльнул(?:ся|ась|ись)|"
+        r"улыбнул(?:ся|ась|ись)|"
+        r"пожал(?:а|о|и)?|"
+        r"кивнул(?:а|о|и)?|"
+        r"вздохнул(?:а|о|и)?|"
+        r"отступил(?:а|о|и)?|"
+        r"схватил(?:а|о|и)?"
+    )
+
+    # Слова автора в диалоге обычно не заканчиваются ?/! (кроме редких случаев).
+    if "?" in t or "!" in t:
+        return bool(
+            re.match(
+                r"^\s*(?:(?:вдруг|тихо|медленно|резко)\s+)?"
+                r"(?:"
+                + verb_core
+                + r")\b",
+                t,
+            )
+        )
+
+    return bool(
+        re.match(
+            r"^\s*(?:(?:она|он|они|я|мы|ты|вы|[а-яёa-z][а-яёa-z-]+)\s+)?"
+            r"(?:(?:вдруг|тихо|медленно|резко)\s+)?"
+            r"(?:"
+            + verb_core
+            + r")\b",
+            t,
+        )
+    )
+
+
+def _make_author_chunk(text: str) -> Chunk:
+    normalized = _ensure_terminal_punctuation(_capitalize_first(_compact_ws(text)))
+    return Chunk(type="author", text=normalized, ssml=None)
+
+
+def _normalize_global(text: str) -> str:
+    text = text.replace("—", "-").replace("–", "-")
+    text = re.sub(r"\?!|!\?", "?", text)
+    return text
+
+
+def _compact_ws(text: str) -> str:
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def _ensure_terminal_punctuation(text: str) -> str:
+    if re.search(r"[,:;]$", text):
+        return re.sub(r"[,:;]$", ".", text)
+    return text if re.search(r"[.!?…]$", text) else f"{text}."
+
+
+def _capitalize_first(text: str) -> str:
+    if not text:
+        return text
+    return text[0].upper() + text[1:]
+
+
+def _detect_kind(sentence: str) -> ChunkType:
+    if sentence.endswith("?"):
+        return "question"
+    if sentence.endswith("!"):
+        return "exclamation"
+    return "line"
+
+
+def _mark_last_word_in_question(text: str) -> str:
+    if not text.endswith("?"):
+        return text
+    body = text[:-1].rstrip()
+    match = re.search(r"([A-Za-zА-Яа-яЁё0-9-]+)$", body)
+    if not match:
+        return text
+    start, end = match.span(1)
+    marked = f"{body[:start]}*{body[start:end]}*"
+    return f"{marked}?"
+
+
+def _build_ssml(text: str, profile: Dict[str, str]) -> str:
+    escaped = html.escape(text, quote=False)
+    return (
+        "<speak><p>"
+        f"<prosody pitch=\"{profile['pitch']}\" rate=\"{profile['rate']}\">{escaped}</prosody>"
+        "</p></speak>"
+    )
+
+
+def _replace_numbers(text: str) -> str:
+    return re.sub(r"\d+", lambda m: int_to_words_ru(int(m.group(0))), text)
+
+
+def int_to_words_ru(number: int) -> str:
+    if number == 0:
+        return "ноль"
+    if number < 0:
+        return f"минус {int_to_words_ru(abs(number))}"
+
+    units_m = ("", "один", "два", "три", "четыре", "пять", "шесть", "семь", "восемь", "девять")
+    units_f = ("", "одна", "две", "три", "четыре", "пять", "шесть", "семь", "восемь", "девять")
+    teens = (
+        "десять",
+        "одиннадцать",
+        "двенадцать",
+        "тринадцать",
+        "четырнадцать",
+        "пятнадцать",
+        "шестнадцать",
+        "семнадцать",
+        "восемнадцать",
+        "девятнадцать",
+    )
+    tens = ("", "", "двадцать", "тридцать", "сорок", "пятьдесят", "шестьдесят", "семьдесят", "восемьдесят", "девяносто")
+    hundreds = ("", "сто", "двести", "триста", "четыреста", "пятьсот", "шестьсот", "семьсот", "восемьсот", "девятьсот")
+
+    scales = [
+        (("", "", ""), False),
+        (("тысяча", "тысячи", "тысяч"), True),
+        (("миллион", "миллиона", "миллионов"), False),
+        (("миллиард", "миллиарда", "миллиардов"), False),
+    ]
+
+    def choose_form(n: int, forms: Tuple[str, str, str]) -> str:
+        n_mod100 = n % 100
+        n_mod10 = n % 10
+        if 11 <= n_mod100 <= 14:
+            return forms[2]
+        if n_mod10 == 1:
+            return forms[0]
+        if 2 <= n_mod10 <= 4:
+            return forms[1]
+        return forms[2]
+
+    def triad_to_words(n: int, feminine: bool) -> List[str]:
+        words: List[str] = []
+        words.append(hundreds[n // 100])
+        last_two = n % 100
+        if 10 <= last_two <= 19:
+            words.append(teens[last_two - 10])
+        else:
+            words.append(tens[last_two // 10])
+            unit = last_two % 10
+            words.append((units_f if feminine else units_m)[unit])
+        return [w for w in words if w]
+
+    triads: List[int] = []
+    n = number
+    while n > 0:
+        triads.append(n % 1000)
+        n //= 1000
+
+    words: List[str] = []
+    for idx in range(len(triads) - 1, -1, -1):
+        triad = triads[idx]
+        if triad == 0:
+            continue
+        forms, feminine = scales[idx] if idx < len(scales) else (("", "", ""), False)
+        words.extend(triad_to_words(triad, feminine))
+        if forms[0]:
+            words.append(choose_form(triad, forms))
+    return " ".join(words)
+
+
+def main() -> None:
+    ap = argparse.ArgumentParser(description="Парсер книги в JSON + chunks debug")
+    ap.add_argument("input", help="Входной .txt файл")
+    args = ap.parse_args()
+
+    json_path, chunks_path = parse_text_file(args.input)
+    print(json_path)
+    print(chunks_path)
+
+
+if __name__ == "__main__":
+    main()
