@@ -117,7 +117,32 @@ def _split_sentences_balanced(sentences: List[str], max_chars: int) -> List[str]
     return out
 
 
-def chunk_text_for_vosk(text: str, max_chars: int = 220) -> List[str]:
+def _pack_chunks_to_max(chunks: List[str], max_chars: int) -> List[str]:
+    """
+    Второй проход: доклеивает соседние короткие чанки до лимита.
+    Границы по ?/! не учитывает (по запросу).
+    """
+    if not chunks:
+        return []
+
+    packed: List[str] = []
+    buf = chunks[0].strip()
+    for nxt in chunks[1:]:
+        n = nxt.strip()
+        if not n:
+            continue
+        candidate = "{0} {1}".format(buf, n)
+        if len(candidate) <= max_chars:
+            buf = candidate
+        else:
+            packed.append(buf)
+            buf = n
+    if buf:
+        packed.append(buf)
+    return packed
+
+
+def chunk_text_for_vosk(text: str, max_chars: int = 250) -> List[str]:
     """
     Режет текст на чанки:
     - сначала по предложениям;
@@ -137,6 +162,7 @@ def chunk_text_for_vosk(text: str, max_chars: int = 220) -> List[str]:
 
     for paragraph in paragraphs:
         p = _compact_ws(paragraph)
+        paragraph_chunks: List[str] = []
         # Разбиваем по концу предложения. Поддерживаем случай, когда после точки
         # нет обычного пробела, но дальше сразу идёт заглавная буква.
         sentences = [
@@ -145,12 +171,16 @@ def chunk_text_for_vosk(text: str, max_chars: int = 220) -> List[str]:
             if s.strip()
         ]
         if not sentences:
-            out.extend(_split_sentence_by_words(p, max_chars))
+            paragraph_chunks.extend(_split_sentence_by_words(p, max_chars))
+            out.extend(paragraph_chunks)
             continue
 
         if len(p) <= max_chars:
-            out.append(p)
+            paragraph_chunks.append(p)
+            out.extend(paragraph_chunks)
             continue
-        out.extend(_split_sentences_balanced(sentences, max_chars))
+        paragraph_chunks.extend(_split_sentences_balanced(sentences, max_chars))
+        out.extend(paragraph_chunks)
 
-    return out
+    # Доклейка выполняется по всему потоку чанков, включая границы абзацев.
+    return _pack_chunks_to_max(out, max_chars)

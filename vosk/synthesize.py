@@ -112,9 +112,9 @@ def synthesize_txt_to_wav(
     input_path: Path,
     output_path: Path,
     model_name: str = "vosk-model-tts-ru-0.9-multi",
-    speaker_id: int = 4,
-    max_chars: int = 300,
-    pause_sec: float = 0.025,
+    speaker_id: int = 3,
+    max_chars: int = 250,
+    pause_sec: float = 0.03,
 ) -> Path:
     from vosk_tts import Model, Synth
 
@@ -174,9 +174,9 @@ def main() -> None:
     ap.add_argument("input", help="Входной .txt")
     ap.add_argument("-o", "--output", help="Выходной .wav")
     ap.add_argument("--model", default="vosk-model-tts-ru-0.9-multi", help="Название модели vosk-tts")
-    ap.add_argument("--speaker-id", type=int, default=4, help="speaker_id (0..4), 3/4 обычно мужские")
-    ap.add_argument("--max-chars", type=int, default=300, help="Максимальная длина чанка")
-    ap.add_argument("--pause-sec", type=float, default=0.025, help="Пауза между чанками")
+    ap.add_argument("--speaker-id", type=int, default=3, help="speaker_id (0..4)")
+    ap.add_argument("--max-chars", type=int, default=250, help="Максимальная длина чанка")
+    ap.add_argument("--pause-sec", type=float, default=0.03, help="Пауза между чанками")
     args = ap.parse_args()
 
     inp = Path(args.input)

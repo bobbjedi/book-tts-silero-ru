@@ -128,16 +128,15 @@ def _strip_unsupported_chars_by_model(text: str, model) -> str:
 
 
 def _build_vosk_chunks_from_paragraphs(paragraphs: List[str], max_chars: int) -> List[str]:
-    chunks: List[str] = []
+    prepared: List[str] = []
     for para in paragraphs:
         p = replace_numbers_ru(para.strip())
-        if not p:
-            continue
-        if len(p) <= max_chars:
-            chunks.append(p)
-        else:
-            chunks.extend(chunk_text_for_vosk(p, max_chars=max_chars))
-    return chunks
+        if p:
+            prepared.append(p)
+    if not prepared:
+        return []
+    # Прогоняем весь поток сразу, чтобы доклейка работала и между абзацами.
+    return chunk_text_for_vosk("\n\n".join(prepared), max_chars=max_chars)
 
 
 def _load_cached_chunks(chunks_json_path: Path, max_chars: int) -> List[str]:
@@ -459,9 +458,9 @@ def synthesize_fb2_to_mp3_chapters(
     fb2_path: Path,
     output_dir: Path,
     model_name: str = "vosk-model-tts-ru-0.9-multi",
-    speaker_id: int = 4,
-    max_chars: int = 300,
-    pause_sec: float = 0.025,
+    speaker_id: int = 3,
+    max_chars: int = 250,
+    pause_sec: float = 0.03,
     workers: int = 1,
 ) -> Path:
     total_started = time.monotonic()
@@ -538,9 +537,9 @@ def main() -> None:
     ap.add_argument("input", help="Входной .fb2")
     ap.add_argument("-o", "--output-dir", help="Папка для MP3 глав")
     ap.add_argument("--model", default="vosk-model-tts-ru-0.9-multi", help="Название модели vosk-tts")
-    ap.add_argument("--speaker-id", type=int, default=4, help="speaker_id (0..4)")
-    ap.add_argument("--max-chars", type=int, default=300, help="Лимит символов на чанк")
-    ap.add_argument("--pause-sec", type=float, default=0.025, help="Пауза между чанками")
+    ap.add_argument("--speaker-id", type=int, default=3, help="speaker_id (0..4)")
+    ap.add_argument("--max-chars", type=int, default=250, help="Лимит символов на чанк")
+    ap.add_argument("--pause-sec", type=float, default=0.03, help="Пауза между чанками")
     ap.add_argument("--workers", type=int, default=1, help="Количество параллельных воркеров по главам")
     args = ap.parse_args()
 

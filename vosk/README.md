@@ -6,9 +6,9 @@
 
 ```bash
 python3 -m vosk.synthesize tests/test.txt \
-  --speaker-id 4 \
-  --pause-sec 0.025 \
-  --max-chars 300
+  --speaker-id 3 \
+  --pause-sec 0.03 \
+  --max-chars 250
 ```
 
 По умолчанию выход: `tests/test.vosk.wav`.
@@ -18,9 +18,9 @@ python3 -m vosk.synthesize tests/test.txt \
 ```bash
 python3 -m vosk.fb2_synthesize "works/Стоит свеч 6 том.fb2" \
   -o "works/Стоит_свеч_6_том_vosk_mp3" \
-  --speaker-id 4 \
-  --pause-sec 0.025 \
-  --max-chars 300 \
+  --speaker-id 3 \
+  --pause-sec 0.03 \
+  --max-chars 250 \
   --workers 2
 ```
 
@@ -41,8 +41,8 @@ python3 -m vosk.fb2_synthesize "works/Стоит свеч 6 том.fb2" \
 
 ## 4) Полезные флаги
 
-- `--speaker-id 4` — мужской голос (дефолт).
-- `--pause-sec 0.025` — пауза между чанками.
-- `--max-chars 300` — лимит символов чанка.
+- `--speaker-id 3` — мужской голос (дефолт).
+- `--pause-sec 0.03` — пауза между чанками.
+- `--max-chars 250` — лимит символов чанка.
 - `--workers 2` — параллельная обработка глав (если хватает CPU/RAM).
 - `--model vosk-model-tts-ru-0.9-multi` — модель vosk-tts.
