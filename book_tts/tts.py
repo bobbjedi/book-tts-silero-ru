@@ -95,7 +95,7 @@ def synthesize_to_wav(
     model_name: str = "v5_4_ru",
     speaker: str = "xenia",
     sample_rate: int = 48000,
-    pause_sec: float = 0.25,
+    pause_sec: float = 0.022,
 ) -> Path:
     chunks, json_path = _load_chunks(input_path)
     print("Чанков: {0} (источник: {1})".format(len(chunks), json_path))
@@ -140,7 +140,7 @@ def main() -> None:
     ap.add_argument("--model", default="v5_4_ru", help="Модель Silero")
     ap.add_argument("--speaker", default="xenia", help="Голос")
     ap.add_argument("--sample-rate", type=int, default=48000, help="Частота дискретизации")
-    ap.add_argument("--pause-sec", type=float, default=0.25, help="Пауза между чанками в секундах")
+    ap.add_argument("--pause-sec", type=float, default=0.022, help="Пауза между чанками в секундах")
     args = ap.parse_args()
 
     input_path = Path(args.input)
