@@ -7,7 +7,17 @@ from typing import List
 
 
 def _compact_ws(text: str) -> str:
-    return re.sub(r"\s+", " ", text).strip()
+    # Нормализуем частые нестандартные пробелы из FB2/копипаста.
+    t = (
+        text.replace("\u00A0", " ")  # NBSP
+        .replace("\u202F", " ")  # narrow NBSP
+        .replace("\u2009", " ")  # thin space
+        .replace("\u200A", " ")  # hair space
+        .replace("\u2007", " ")  # figure space
+        .replace("\u2060", "")  # word joiner
+        .replace("\u200B", "")  # zero width space
+    )
+    return re.sub(r"\s+", " ", t).strip()
 
 
 def _split_sentence_by_words(sentence: str, max_chars: int) -> List[str]:
@@ -127,7 +137,13 @@ def chunk_text_for_vosk(text: str, max_chars: int = 220) -> List[str]:
 
     for paragraph in paragraphs:
         p = _compact_ws(paragraph)
-        sentences = [s.strip() for s in re.split(r"(?<=[.!?…])\s+", p) if s.strip()]
+        # Разбиваем по концу предложения. Поддерживаем случай, когда после точки
+        # нет обычного пробела, но дальше сразу идёт заглавная буква.
+        sentences = [
+            s.strip()
+            for s in re.findall(r".+?(?:[.!?…](?=\s+|$|[A-ZА-ЯЁ])|$)", p)
+            if s.strip()
+        ]
         if not sentences:
             out.extend(_split_sentence_by_words(p, max_chars))
             continue
