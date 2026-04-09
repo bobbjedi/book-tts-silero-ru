@@ -5,7 +5,32 @@
 - `book_tts/tts.py` — озвучка чанков в `wav` через Silero
 - `book_tts/fb2_tts.py` — озвучка `.fb2` по главам в `mp3`
 
-## Быстрый старт
+## Запуск за 1 минуту
+
+```bash
+# 1) TXT -> WAV
+python3 -m book_tts.tts tests/test.txt
+
+# 2) FB2 -> MP3 по главам
+python3 -u -m book_tts.fb2_tts "works/Незнайка на Луне.fb2"
+```
+
+Где искать результат:
+- TXT: `tests/test.wav`
+- FB2: папка `works/Незнайка на Луне/`
+
+## Что нужно для работы
+
+- `python3`
+- `ffmpeg` (обязательно, используется для склейки и mp3)
+- PyTorch + зависимости Silero (если уже запускал скрипты, скорее всего все есть)
+
+Проверка `ffmpeg`:
+```bash
+ffmpeg -version
+```
+
+## Подробно
 
 ### 1) Парсинг текста
 ```bash
@@ -35,10 +60,10 @@ python3 -m book_tts.parser <input.txt> --max-chars 850
 
 ### TTS
 ```bash
-python3 -m book_tts.tts <input.txt|input.parsed.json> -o out.wav --pause-sec 0.25 --speaker xenia
+python3 -m book_tts.tts <input.txt|input.parsed.json> -o out.wav --pause-sec 0.022 --speaker xenia
 ```
 - `--speaker` по умолчанию: `xenia`
-- `--pause-sec` по умолчанию: `0.25`
+- `--pause-sec` по умолчанию: `0.022` (22 мс)
 - `--sample-rate` по умолчанию: `48000`
 - `--model` по умолчанию: `v5_4_ru`
 
@@ -49,11 +74,11 @@ python3 -m book_tts.fb2_tts works/book.fb2
 
 Результат:
 - директория `works/book_mp3/`
-- файлы вида `001_<название_главы>.mp3`, `002_<название_главы>.mp3`, ...
+- файлы вида `Глава 106 ... .mp3`, `Глава 107 ... .mp3`, ...
 
 Опции:
 ```bash
-python3 -m book_tts.fb2_tts works/book.fb2 -o works/output_mp3 --pause-sec 0.25 --speaker xenia --max-chars 850
+python3 -m book_tts.fb2_tts works/book.fb2 -o works/output_mp3 --pause-sec 0.022 --speaker xenia --max-chars 850
 ```
 
 ## Примечания
