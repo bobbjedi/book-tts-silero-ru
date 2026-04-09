@@ -12,10 +12,14 @@ from typing import Dict, List, Literal, Optional, Tuple
 
 ChunkType = Literal["author", "line", "question", "exclamation"]
 
+# Поддерживаемые значения Silero SSML (prosody).
+SUPPORTED_RATE_VALUES = ("x-slow", "slow", "medium", "fast", "x-fast")
+SUPPORTED_PITCH_VALUES = ("x-low", "low", "medium", "high", "x-high")
+
 DEFAULT_PROFILES: Dict[ChunkType, Dict[str, str]] = {
-    "line": {"pitch": "+2%", "rate": "+1%"},
-    "exclamation": {"pitch": "+4%", "rate": "+2%"},
-    "question": {"pitch": "+7%", "rate": "+2%"},
+    "line": {"pitch": "high", "rate": "medium"},
+    "exclamation": {"pitch": "x-high", "rate": "medium"},
+    "question": {"pitch": "high", "rate": "medium"},
     "author": {},
 }
 
@@ -116,9 +120,15 @@ def _speech_to_chunks(
         if out and out[-1].type == kind and kind != "question":
             merged_text = "{0} {1}".format(out[-1].text, sentence)
             out[-1].text = merged_text
-            out[-1].ssml = _build_ssml(merged_text, profiles[kind])
+            if kind == "question":
+                out[-1].ssml = _build_plain_ssml(merged_text)
+            else:
+                out[-1].ssml = _build_ssml(merged_text, profiles[kind])
             continue
-        ssml = _build_ssml(sentence, profiles[kind])
+        if kind == "question":
+            ssml = _build_plain_ssml(sentence)
+        else:
+            ssml = _build_ssml(sentence, profiles[kind])
         out.append(Chunk(type=kind, text=sentence, ssml=ssml))
     return out
 
@@ -217,11 +227,18 @@ def _mark_last_word_in_question(text: str) -> str:
 
 def _build_ssml(text: str, profile: Dict[str, str]) -> str:
     escaped = html.escape(text, quote=False)
+    pitch = profile.get("pitch", "medium")
+    rate = profile.get("rate", "medium")
     return (
         "<speak><p>"
-        f"<prosody pitch=\"{profile['pitch']}\" rate=\"{profile['rate']}\">{escaped}</prosody>"
+        f"<prosody pitch=\"{pitch}\" rate=\"{rate}\">{escaped}</prosody>"
         "</p></speak>"
     )
+
+
+def _build_plain_ssml(text: str) -> str:
+    escaped = html.escape(text, quote=False)
+    return "<speak><p>{0}</p></speak>".format(escaped)
 
 
 def _replace_numbers(text: str) -> str:

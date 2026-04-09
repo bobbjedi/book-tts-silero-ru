@@ -40,15 +40,21 @@
 ## 5) Интонации и SSML
 
 ### Константы (изменяемые)
-- `line`: `pitch="+2%"`, `rate="+1%"`
-- `exclamation`: `pitch="+4%"`, `rate="+2%"`
-- `question`: `pitch="+7%"`, `rate="+2%"`
+- Silero SSML использует коды, а не проценты.
+- Допустимые `rate`: `x-slow | slow | medium | fast | x-fast`
+- Допустимые `pitch`: `x-low | low | medium | high | x-high`
+- Текущий пресет:
+  - `line`: `pitch="high"`, `rate="fast"`
+  - `exclamation`: `pitch="x-high"`, `rate="fast"`
+  - `question`: без `prosody` (используем нативную вопросительную интонацию)
 
 ### Правила
 - Для `author` SSML не добавляется, текст отдается как есть.
-- Для `line | exclamation | question` контейнеры `<speak><p>...</p></speak>` обязательны.
-- Для `line | exclamation | question` текст оборачивается в полный шаблон:
+- Для всех не-авторских чанков контейнеры `<speak><p>...</p></speak>` обязательны.
+- Для `line | exclamation` текст оборачивается в:
 `<speak><p><prosody pitch="..." rate="...">...</prosody></p></speak>`
+- Для `question` используется plain SSML без `prosody`:
+`<speak><p>...</p></speak>`
 - Для `question` последнее слово перед `?` помечается `*...*`.
   - Пример: `Зачем ты это *сделала*?`
 
@@ -65,7 +71,8 @@
 ```json
 [
   {"type":"author","text":"Валенсия поерзала."},
-  {"type":"line","text":"Нет.","ssml":"<speak><p><prosody pitch=\"+2%\" rate=\"+1%\">Нет.</prosody></p></speak>"},
+  {"type":"line","text":"Нет.","ssml":"<speak><p><prosody pitch=\"high\" rate=\"fast\">Нет.</prosody></p></speak>"},
+  {"type":"question","text":"Ты уверена, что это *нужно*?","ssml":"<speak><p>Ты уверена, что это *нужно*?</p></speak>"},
   {"type":"author","text":"Сказала она."}
 ]
 ```

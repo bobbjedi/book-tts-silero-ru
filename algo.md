@@ -57,21 +57,22 @@
               </speak>
 ```
 
-Кроме этого rate и pitch указываются в %, (pitch="+5%").
+Важно: для Silero в SSML используются не проценты, а коды:
+- rate: x-slow | slow | medium | fast | x-fast
+- pitch: x-low | low | medium | high | x-high
 
 Исходя из этого, нужно сделать константы изменяемые, например
 
 Реплика:
-pitch=+2%
-rate=+1%
+pitch=high
+rate=fast
 
 Восклицание:
-pitch=+4%
-rate=+2%
+pitch=x-high
+rate=fast
 
 Вопрос
-pitch=+7%
-rate=+2%
+без prosody (оставляем только <speak><p>...</p></speak> и *слово* перед ?)
 
 И оборачивать соответсвующик чанки в ssml.
 
