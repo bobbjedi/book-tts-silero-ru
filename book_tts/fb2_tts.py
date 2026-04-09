@@ -10,6 +10,7 @@ import shutil
 import subprocess
 import sys
 import xml.etree.ElementTree as ET
+from datetime import datetime
 from pathlib import Path
 from typing import Dict, List, Tuple
 
@@ -20,6 +21,11 @@ from .parser import Chunk, parse_book_text
 FB2_NS = {"fb": "http://www.gribuser.ru/xml/fictionbook/2.0"}
 
 
+def _log(message: str) -> None:
+    ts = datetime.now().strftime("%H:%M:%S")
+    print("[{0}] {1}".format(ts, message), flush=True)
+
+
 def _safe_name(name: str, max_len: int = 120) -> str:
     s = re.sub(r"\s+", " ", name).strip()
     s = re.sub(r"[\\/:*?\"<>|]", "_", s)
@@ -27,6 +33,17 @@ def _safe_name(name: str, max_len: int = 120) -> str:
     if not s:
         s = "chapter"
     return s[:max_len].rstrip(". ")
+
+
+def _short_chapter_title(title: str) -> str:
+    t = re.sub(r"\s+", " ", title).strip()
+    # Приводим к формату, начинающемуся с "Глава XXX ...".
+    m = re.search(r"(глава\s+\d+)\s*[:.]?\s*(.*)$", t, flags=re.IGNORECASE)
+    if not m:
+        return t
+    head = m.group(1).title()
+    tail = m.group(2).strip()
+    return "{0} {1}".format(head, tail).strip()
 
 
 def _extract_title(section: ET.Element) -> str:
@@ -144,6 +161,7 @@ def _synthesize_chapter_wav(
     chunks = parse_book_text(chapter_text, max_chars=max_chars)
     if not chunks:
         raise ValueError("Пустой набор чанков")
+    _log("Глава '{0}': чанков после парсера = {1}".format(chapter_name, len(chunks)))
 
     chapter_key = hashlib.sha1((chapter_name + "\n" + chapter_text).encode("utf-8")).hexdigest()[:16]
     chapter_work_dir = work_root / chapter_key
@@ -167,19 +185,24 @@ def _synthesize_chapter_wav(
         skip_marker = parts_dir / "part_{0:05d}.skip".format(idx)
 
         if skip_marker.exists():
+            _log("  ch#{0}: skip marker".format(idx))
             continue
         if part_path.exists() and part_path.stat().st_size > 0:
+            _log("  ch#{0}: reuse wav".format(idx))
             parts.append(part_path)
             continue
 
         if _save_chunk_wav(model, chunk, part_path, speaker, sample_rate):
             skip_marker.unlink(missing_ok=True)
+            _log("  ch#{0}: generated wav".format(idx))
             parts.append(part_path)
         else:
             skip_marker.write_text("skip", encoding="utf-8")
+            _log("  ch#{0}: marked as skip".format(idx))
 
     if not parts:
         raise ValueError("В главе нет озвучиваемого текста")
+    _log("Глава '{0}': concat {1} частей".format(chapter_name, len(parts)))
     _concat_wavs(parts, wav_out, chapter_work_dir, pause_sec, sample_rate)
 
 
@@ -187,7 +210,18 @@ def _normalize_chunk_text_for_tts(text: str) -> str:
     cleaned = re.sub(r"\s+", " ", text).strip()
     # Декоративные разделители вида "***" не озвучиваем.
     cleaned = re.sub(r"^\*+(?:\s+\*+)*[.!?…]*$", "", cleaned).strip()
+    # Проблемные кавычки для некоторых версий tokenizer Silero.
+    cleaned = cleaned.replace('"', "")
     return cleaned
+
+
+def _strip_unsupported_chars_by_model(text: str, model) -> str:
+    symbols = getattr(model, "symbols", None)
+    if not isinstance(symbols, str) or not symbols:
+        return text
+    allowed = set(symbols)
+    cleaned = "".join(ch for ch in text.lower() if ch in allowed)
+    return re.sub(r"\s+", " ", cleaned).strip()
 
 
 def _save_chunk_wav(model, chunk: Chunk, part_path: Path, speaker: str, sample_rate: int) -> bool:
@@ -203,10 +237,23 @@ def _save_chunk_wav(model, chunk: Chunk, part_path: Path, speaker: str, sample_r
             return True
         except Exception:
             # Для нестабильных SSML-кейсов fallback в plain text.
+            _log("  fallback to plain text (SSML parse error)")
             pass
 
-    model.save_wav(text=text, speaker=speaker, sample_rate=sample_rate, audio_path=str(part_path))
-    return True
+    try:
+        model.save_wav(text=text, speaker=speaker, sample_rate=sample_rate, audio_path=str(part_path))
+        return True
+    except Exception as exc:
+        safe_text = _strip_unsupported_chars_by_model(text, model)
+        if safe_text and safe_text != text:
+            _log("  sanitize unsupported chars and retry")
+            try:
+                model.save_wav(text=safe_text, speaker=speaker, sample_rate=sample_rate, audio_path=str(part_path))
+                return True
+            except Exception as exc2:
+                _log("  sanitized retry failed: {0}".format(exc2))
+        _log("  chunk failed permanently: {0}".format(exc))
+        return False
 
 
 def synthesize_fb2_to_mp3_chapters(
@@ -221,6 +268,7 @@ def synthesize_fb2_to_mp3_chapters(
     chapters = extract_fb2_chapters(fb2_path)
     if not chapters:
         raise ValueError("Не удалось извлечь главы из FB2")
+    _log("Извлечено глав: {0}".format(len(chapters)))
 
     output_dir.mkdir(parents=True, exist_ok=True)
     work_root = output_dir / ".fb2_tts_work"
@@ -233,19 +281,22 @@ def synthesize_fb2_to_mp3_chapters(
         speaker=model_name,
         trust_repo=True,
     )
+    _log("Модель загружена: {0}, голос: {1}, pause_sec={2}".format(model_name, speaker, pause_sec))
 
     for idx, (title, text) in enumerate(chapters, 1):
-        safe_title = _safe_name(title)
-        base_name = "{0:03d}_{1}".format(idx, safe_title)
+        short_title = _short_chapter_title(title)
+        safe_title = _safe_name(short_title)
+        base_name = safe_title
         wav_path = output_dir / "{0}.wav".format(base_name)
         mp3_path = output_dir / "{0}.mp3".format(base_name)
         chapter_key = hashlib.sha1((title + "\n" + text).encode("utf-8")).hexdigest()[:16]
         chapter_work_dir = work_root / chapter_key
 
         if mp3_path.exists() and mp3_path.stat().st_size > 0:
-            print("[{0}/{1}] skip existing {2}".format(idx, len(chapters), mp3_path.name))
+            _log("[{0}/{1}] skip existing {2}".format(idx, len(chapters), mp3_path.name))
             continue
 
+        _log("[{0}/{1}] start {2}".format(idx, len(chapters), base_name))
         _synthesize_chapter_wav(
             model=model,
             chapter_name=title,
@@ -257,11 +308,12 @@ def synthesize_fb2_to_mp3_chapters(
             pause_sec=pause_sec,
             max_chars=max_chars,
         )
+        _log("[{0}/{1}] convert wav->mp3".format(idx, len(chapters)))
         _wav_to_mp3(wav_path, mp3_path)
         wav_path.unlink(missing_ok=True)
         if chapter_work_dir.exists():
             shutil.rmtree(chapter_work_dir)
-        print("[{0}/{1}] {2}".format(idx, len(chapters), mp3_path.name))
+        _log("[{0}/{1}] done {2}".format(idx, len(chapters), mp3_path.name))
 
     return output_dir
 
