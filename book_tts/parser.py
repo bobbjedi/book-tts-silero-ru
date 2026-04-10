@@ -23,7 +23,7 @@ DEFAULT_PROFILES: Dict[ChunkType, Dict[str, str]] = {
     "line": {"pitch": "high", "rate": "medium"},
     "exclamation": {"pitch": "x-high", "rate": "medium"},
     "question": {"pitch": "high", "rate": "medium"},
-    "author": {},
+    "author": {"pitch": "low", "rate": "medium"},
 }
 
 
@@ -87,7 +87,7 @@ def _parse_paragraph(
 ) -> List[Chunk]:
     p = _compact_ws(paragraph)
     if not p.startswith("-"):
-        return [_make_author_chunk(p)]
+        return [_make_author_chunk(p, profiles)]
 
     body = p[1:].strip()
     parts = [part.strip() for part in re.split(r"\s+-\s+", body) if part.strip()]
@@ -99,7 +99,7 @@ def _parse_paragraph(
             if speech_buffer:
                 chunks.extend(_speech_to_chunks(" - ".join(speech_buffer), profiles))
                 speech_buffer = []
-            chunks.append(_make_author_chunk(part))
+            chunks.append(_make_author_chunk(part, profiles))
         else:
             speech_buffer.append(part)
 
@@ -165,7 +165,7 @@ def _split_chunk(
         return [chunk]
 
     if chunk.type == "author":
-        return [_make_author_chunk(piece) for piece in pieces]
+        return [_make_author_chunk(piece, profiles) for piece in pieces]
 
     split_result: List[Chunk] = []
     for piece in pieces:
@@ -278,9 +278,10 @@ def _looks_like_author_remark(text: str) -> bool:
     )
 
 
-def _make_author_chunk(text: str) -> Chunk:
+def _make_author_chunk(text: str, profiles: Dict[ChunkType, Dict[str, str]]) -> Chunk:
     normalized = _ensure_terminal_punctuation(_capitalize_first(_compact_ws(text)))
-    return Chunk(type="author", text=normalized, ssml=None)
+    ssml = _build_ssml(normalized, profiles["author"])
+    return Chunk(type="author", text=normalized, ssml=ssml)
 
 
 def _normalize_global(text: str) -> str:
