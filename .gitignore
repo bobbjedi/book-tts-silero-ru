@@ -8,6 +8,6 @@ __pycache__/
 *.json
 *.wav
 *.mp3
-works
+work
 .venv*
 .DS_Store
