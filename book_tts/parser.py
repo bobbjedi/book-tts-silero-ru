@@ -25,6 +25,28 @@ DEFAULT_PROFILES: Dict[ChunkType, Dict[str, str]] = {
     "question": {"pitch": "high", "rate": "medium"},
     "author": {"pitch": "low", "rate": "medium"},
 }
+# Слова, вокруг которых убираем запятые (слова-паразиты и т.п.).
+COMMA_NORMALIZE_CONFIG = {
+    "strip_around_words": [
+        "блин",
+        "бля",
+        "блядь",
+        "сука",
+        "короче",
+        "типа",
+        "вроде",
+        "значит",
+        "походу",
+        "похоже",
+        "слушай",
+        "слышь",
+        "кстати",
+        "вообще",
+        "реально",
+        "честно",
+        "блинчик",
+    ],
+}
 
 
 @dataclass
@@ -287,12 +309,25 @@ def _make_author_chunk(text: str, profiles: Dict[ChunkType, Dict[str, str]]) -> 
 def _normalize_global(text: str) -> str:
     # text = normalize_yo_to_e(text)
     text = text.replace("—", "-").replace("–", "-")
+    text = _normalize_commas_around_config_words(text)
     text = re.sub(r"\?!|!\?", "?", text)
     return text
 
 
 def _compact_ws(text: str) -> str:
     return re.sub(r"\s+", " ", text).strip()
+
+
+def _normalize_commas_around_config_words(text: str) -> str:
+    words = COMMA_NORMALIZE_CONFIG.get("strip_around_words", [])
+    out = text
+    for word in words:
+        escaped = re.escape(word)
+        # Убираем запятую перед словом: "ну, блин" -> "ну блин"
+        out = re.sub(rf"(?i),\s*(\b{escaped}\b)", r" \1", out)
+        # Убираем запятую после слова: "блин, я" -> "блин я"
+        out = re.sub(rf"(?i)(\b{escaped}\b)\s*,\s*", r"\1 ", out)
+    return re.sub(r"[ \t]{2,}", " ", out)
 
 
 def _ensure_terminal_punctuation(text: str) -> str:
