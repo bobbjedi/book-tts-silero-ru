@@ -285,7 +285,7 @@ def _make_author_chunk(text: str, profiles: Dict[ChunkType, Dict[str, str]]) -> 
 
 
 def _normalize_global(text: str) -> str:
-    text = normalize_yo_to_e(text)
+    # text = normalize_yo_to_e(text)
     text = text.replace("—", "-").replace("–", "-")
     text = re.sub(r"\?!|!\?", "?", text)
     return text

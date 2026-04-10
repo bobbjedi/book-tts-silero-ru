@@ -233,7 +233,13 @@ def _save_chunk_wav(model, chunk: Chunk, part_path: Path, speaker: str, sample_r
     if chunk.ssml and text == original_text:
         ssml_text = chunk.ssml
         try:
-            model.save_wav(ssml_text=ssml_text, speaker=speaker, sample_rate=sample_rate, audio_path=str(part_path))
+            model.save_wav(
+                ssml_text=ssml_text,
+                speaker=speaker,
+                sample_rate=sample_rate,
+                audio_path=str(part_path),
+                put_yo=True,
+            )
             return True
         except Exception:
             # Для нестабильных SSML-кейсов fallback в plain text.
@@ -241,14 +247,26 @@ def _save_chunk_wav(model, chunk: Chunk, part_path: Path, speaker: str, sample_r
             pass
 
     try:
-        model.save_wav(text=text, speaker=speaker, sample_rate=sample_rate, audio_path=str(part_path))
+        model.save_wav(
+            text=text,
+            speaker=speaker,
+            sample_rate=sample_rate,
+            audio_path=str(part_path),
+            put_yo=True,
+        )
         return True
     except Exception as exc:
         safe_text = _strip_unsupported_chars_by_model(text, model)
         if safe_text and safe_text != text:
             _log("  sanitize unsupported chars and retry")
             try:
-                model.save_wav(text=safe_text, speaker=speaker, sample_rate=sample_rate, audio_path=str(part_path))
+                model.save_wav(
+                    text=safe_text,
+                    speaker=speaker,
+                    sample_rate=sample_rate,
+                    audio_path=str(part_path),
+                    put_yo=True,
+                )
                 return True
             except Exception as exc2:
                 _log("  sanitized retry failed: {0}".format(exc2))
