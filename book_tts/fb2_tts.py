@@ -16,6 +16,7 @@ from typing import Dict, List, Tuple
 
 import torch
 
+from .audio_pitch import apply_post_tone_wav
 from .parser import Chunk, parse_book_text
 
 FB2_NS = {"fb": "http://www.gribuser.ru/xml/fictionbook/2.0"}
@@ -215,6 +216,15 @@ def _normalize_chunk_text_for_tts(text: str) -> str:
     return cleaned
 
 
+def _apply_chunk_post_tone(part_path: Path, chunk: Chunk, sample_rate: int) -> None:
+    pt = (chunk.post_tone or "").strip()
+    if not pt:
+        return
+    tmp = part_path.with_name(part_path.stem + "_pt.wav")
+    apply_post_tone_wav(part_path, tmp, pt, sample_rate)
+    shutil.move(str(tmp), str(part_path))
+
+
 def _strip_unsupported_chars_by_model(text: str, model) -> str:
     symbols = getattr(model, "symbols", None)
     if not isinstance(symbols, str) or not symbols:
@@ -240,6 +250,7 @@ def _save_chunk_wav(model, chunk: Chunk, part_path: Path, speaker: str, sample_r
                 audio_path=str(part_path),
                 put_yo=True,
             )
+            _apply_chunk_post_tone(part_path, chunk, sample_rate)
             return True
         except Exception:
             # Для нестабильных SSML-кейсов fallback в plain text.
@@ -254,6 +265,7 @@ def _save_chunk_wav(model, chunk: Chunk, part_path: Path, speaker: str, sample_r
             audio_path=str(part_path),
             put_yo=True,
         )
+        _apply_chunk_post_tone(part_path, chunk, sample_rate)
         return True
     except Exception as exc:
         safe_text = _strip_unsupported_chars_by_model(text, model)
@@ -267,6 +279,7 @@ def _save_chunk_wav(model, chunk: Chunk, part_path: Path, speaker: str, sample_r
                     audio_path=str(part_path),
                     put_yo=True,
                 )
+                _apply_chunk_post_tone(part_path, chunk, sample_rate)
                 return True
             except Exception as exc2:
                 _log("  sanitized retry failed: {0}".format(exc2))

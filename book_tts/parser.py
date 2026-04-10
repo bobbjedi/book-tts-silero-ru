@@ -23,7 +23,8 @@ DEFAULT_PROFILES: Dict[ChunkType, Dict[str, str]] = {
     "line": {"pitch": "high", "rate": "medium"},
     "exclamation": {"pitch": "x-high", "rate": "medium"},
     "question": {"pitch": "high", "rate": "medium"},
-    "author": {"pitch": "low", "rate": "medium"},
+    # Авторский текст без SSML — движок звучит нейтральнее; prosody оставляем для реплик.
+    "author": {},
 }
 # Слова, вокруг которых убираем запятые (слова-паразиты и т.п.).
 COMMA_NORMALIZE_CONFIG = {
@@ -54,11 +55,15 @@ class Chunk:
     type: ChunkType
     text: str
     ssml: Optional[str] = None
+    # Постобработка тона WAV (ffmpeg): «-3%», «+2%», «-5hz» — см. README, book_tts.audio_pitch.
+    post_tone: Optional[str] = None
 
     def to_dict(self) -> Dict[str, str]:
         data = {"type": self.type, "text": self.text}
         if self.ssml is not None:
             data["ssml"] = self.ssml
+        if self.post_tone:
+            data["post_tone"] = self.post_tone
         return data
 
 
@@ -147,16 +152,21 @@ def _speech_to_chunks(
         if out and out[-1].type == kind and kind != "question":
             merged_text = "{0} {1}".format(out[-1].text, sentence)
             out[-1].text = merged_text
-            if kind == "question":
-                out[-1].ssml = _build_plain_ssml(merged_text)
-            else:
-                out[-1].ssml = _build_ssml(merged_text, profiles[kind])
+            out[-1].ssml = _build_ssml(merged_text, profiles[kind])
+            out[-1].post_tone = _profile_post_tone(profiles[kind])
             continue
         if kind == "question":
             ssml = _build_plain_ssml(sentence)
         else:
             ssml = _build_ssml(sentence, profiles[kind])
-        out.append(Chunk(type=kind, text=sentence, ssml=ssml))
+        out.append(
+            Chunk(
+                type=kind,
+                text=sentence,
+                ssml=ssml,
+                post_tone=_profile_post_tone(profiles[kind]),
+            )
+        )
     return out
 
 
@@ -303,7 +313,12 @@ def _looks_like_author_remark(text: str) -> bool:
 def _make_author_chunk(text: str, profiles: Dict[ChunkType, Dict[str, str]]) -> Chunk:
     normalized = _ensure_terminal_punctuation(_capitalize_first(_compact_ws(text)))
     ssml = _build_ssml(normalized, profiles["author"])
-    return Chunk(type="author", text=normalized, ssml=ssml)
+    return Chunk(
+        type="author",
+        text=normalized,
+        ssml=ssml,
+        post_tone=_profile_post_tone(profiles["author"]),
+    )
 
 
 def _normalize_global(text: str) -> str:
@@ -362,10 +377,28 @@ def _mark_last_word_in_question(text: str) -> str:
     return f"{marked}?"
 
 
-def _build_ssml(text: str, profile: Dict[str, str]) -> str:
+def _profile_post_tone(profile: Dict[str, str]) -> Optional[str]:
+    raw = profile.get("post_tone") or profile.get("pitch_shift")
+    if raw is None:
+        return None
+    s = str(raw).strip()
+    return s or None
+
+
+def _build_ssml(text: str, profile: Dict[str, str]) -> Optional[str]:
+    """
+    SSML с <prosody> только если задан хотя бы один из pitch/rate (непустая строка).
+    Иначе None — в TTS уходит обычный text без SSML (остаётся, например, только post_tone).
+    """
+    p_raw = profile.get("pitch")
+    r_raw = profile.get("rate")
+    p_set = isinstance(p_raw, str) and p_raw.strip() != ""
+    r_set = isinstance(r_raw, str) and r_raw.strip() != ""
+    if not p_set and not r_set:
+        return None
+    pitch = p_raw.strip() if p_set else "medium"
+    rate = r_raw.strip() if r_set else "medium"
     escaped = html.escape(text, quote=False)
-    pitch = profile.get("pitch", "medium")
-    rate = profile.get("rate", "medium")
     return (
         "<speak><p>"
         f"<prosody pitch=\"{pitch}\" rate=\"{rate}\">{escaped}</prosody>"

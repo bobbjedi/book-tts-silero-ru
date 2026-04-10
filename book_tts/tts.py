@@ -7,11 +7,13 @@ import json
 import shutil
 import subprocess
 import sys
+from collections import Counter
 from pathlib import Path
 from typing import Dict, List, Tuple
 
 import torch
 
+from .audio_pitch import apply_post_tone_wav
 from .parser import parse_text_file
 
 
@@ -36,7 +38,16 @@ def _load_chunks(input_path: Path) -> Tuple[List[Dict[str, str]], Path]:
         if not chunk_type or not text:
             raise ValueError("Пустой type/text в чанке #{0}".format(idx))
         ssml = item.get("ssml")
-        chunks.append({"type": chunk_type, "text": text, "ssml": ssml.strip() if isinstance(ssml, str) else ""})
+        raw_tone = item.get("post_tone") or item.get("pitch_shift")
+        post_tone = raw_tone.strip() if isinstance(raw_tone, str) else ""
+        chunks.append(
+            {
+                "type": chunk_type,
+                "text": text,
+                "ssml": ssml.strip() if isinstance(ssml, str) else "",
+                "post_tone": post_tone,
+            }
+        )
     return chunks, json_path
 
 
@@ -99,6 +110,12 @@ def synthesize_to_wav(
 ) -> Path:
     chunks, json_path = _load_chunks(input_path)
     print("Чанков: {0} (источник: {1})".format(len(chunks), json_path))
+    pt_vals = [(c.get("post_tone") or "").strip() for c in chunks]
+    pt_nonempty = [v for v in pt_vals if v]
+    if pt_nonempty:
+        print("post_tone в чанках: {0}".format(dict(Counter(pt_nonempty))))
+    else:
+        print("post_tone: нет ни в одном чанке")
 
     model, _ = torch.hub.load(
         repo_or_dir="snakers4/silero-models",
@@ -115,6 +132,7 @@ def synthesize_to_wav(
 
     try:
         parts: List[Path] = []
+        post_tone_applied = 0
         for idx, chunk in enumerate(chunks, 1):
             text = _prepare_tts_text(chunk["text"])
             part_path = tmp_dir / "part_{0:04d}.wav".format(idx)
@@ -123,7 +141,16 @@ def synthesize_to_wav(
                 model.save_wav(ssml_text=ssml_text, speaker=speaker, sample_rate=sample_rate, audio_path=str(part_path))
             else:
                 model.save_wav(text=text, speaker=speaker, sample_rate=sample_rate, audio_path=str(part_path))
+            pt = (chunk.get("post_tone") or "").strip()
+            if pt:
+                shifted = tmp_dir / "part_{0:04d}_pt.wav".format(idx)
+                apply_post_tone_wav(part_path, shifted, pt, sample_rate)
+                shutil.move(str(shifted), str(part_path))
+                post_tone_applied += 1
             parts.append(part_path)
+
+        if post_tone_applied:
+            print("post_tone: ffmpeg применён к {0} wav-фрагментам".format(post_tone_applied))
 
         _concat_wavs(parts, output_path, tmp_dir, pause_sec, sample_rate)
     finally:
