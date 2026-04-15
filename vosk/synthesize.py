@@ -30,7 +30,9 @@ def _normalize_for_vosk(text: str) -> str:
         .replace("’", "")
         .replace("—", "-")
         .replace("–", "-")
+        .replace("…", ".")
     )
+    t = re.sub(r"\.{3,}", ".", t)
     return re.sub(r"\s+", " ", t).strip()
 
 
