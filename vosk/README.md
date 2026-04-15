@@ -1,6 +1,18 @@
 # Vosk TTS (RU)
 
-Минимальный набор команд для ветки `vosk`.
+Короткий гайд для `vosk.fb2_synthesize` и `vosk.synthesize`.
+
+## Зависимости
+
+- `python3`
+- `ffmpeg`
+- установленный `vosk_tts`
+- для акцента: `ruaccent`
+
+Проверка:
+```bash
+ffmpeg -version
+```
 
 ## 1) TXT -> WAV
 
@@ -11,38 +23,52 @@ python3 -m vosk.synthesize tests/test.txt \
   --max-chars 250
 ```
 
-По умолчанию выход: `tests/test.vosk.wav`.
+Результат по умолчанию: `tests/test.vosk.wav`.
 
-## 2) FB2 -> MP3 (по главам)
+## 2) FB2 -> MP3 по главам
 
 ```bash
-python3 -m vosk.fb2_synthesize "works/Стоит свеч 6 том.fb2" \
-  -o "works/Стоит_свеч_6_том_vosk_mp3" \
+python3 -m vosk.fb2_synthesize "work/WTC 6_7.fb2" \
+  -o "work/WTC 6_7_vosk_mp3" \
   --speaker-id 3 \
   --pause-sec 0.03 \
   --max-chars 250 \
-  --workers 2
+  --workers 1
 ```
 
-Что делает:
-- берёт `<section>` как главу;
-- внутри главы использует абзацы `<p>`;
-- перед чанкингом заменяет цифры на слова и `ё -> е`;
-- если абзац `<= max_chars` — отдаёт как есть;
-- если абзац `> max_chars` — делит на примерно равные куски `< max_chars` по целым предложениям;
-- собирает WAV и конвертирует в MP3.
+## 3) FB2 + ruaccent
 
-## 3) Resume и пропуски
+```bash
+python3 -m vosk.fb2_synthesize "work/WTC 6_7.fb2" \
+  --accent \
+  --accent-model-size turbo3.1
+```
 
-- Если `*.mp3` главы уже есть, глава пропускается.
-- Временные данные хранятся в `OUTPUT/.vosk_fb2_work/`.
-- Для каждой главы сохраняются `chunks.json` и `chunks.txt`; при рестарте они подхватываются.
-- Если чанк не удалось озвучить, рядом пишется `part_XXXXX.skip` с `reason` и `chunk_text`.
+Опции `ruaccent`:
+- `--accent` — включить расстановку `+` ударений перед синтезом.
+- `--accent-model-size` — размер омограф-модели.
+- `--accent-use-dictionary` — использовать словарь (по умолчанию включен).
+- `--accent-no-dictionary` — отключить словарь.
+- `--accent-models-dir` — папка моделей; если не задана, используется общий кэш пользователя.
 
-## 4) Полезные флаги
+## 4) Запуск с логом
 
-- `--speaker-id 3` — мужской голос (дефолт).
-- `--pause-sec 0.03` — пауза между чанками.
-- `--max-chars 250` — лимит символов чанка.
-- `--workers 2` — параллельная обработка глав (если хватает CPU/RAM).
-- `--model vosk-model-tts-ru-0.9-multi` — модель vosk-tts.
+```bash
+python3 -m vosk.fb2_synthesize "work/WTC 6_7.fb2" --accent 2>&1 | tee "work/WTC 6_7_accent_vosk.log"
+```
+
+## 5) Resume / кэш
+
+- Готовая глава (`*.mp3`) пропускается.
+- Промежуточные данные: `OUTPUT/.vosk_fb2_work/`.
+- Для главы сохраняются `chunks.json`, `chunks.txt`, `state.json`.
+- При перезапуске части `part_XXXXX.wav` переиспользуются.
+- При сбое чанка создается `part_XXXXX.skip`.
+
+## 6) Важные флаги
+
+- `--model` (по умолчанию `vosk-model-tts-ru-0.9-multi`)
+- `--speaker-id` (по умолчанию `3`)
+- `--max-chars` (по умолчанию `250`)
+- `--pause-sec` (по умолчанию `0.03`)
+- `--workers` (по умолчанию `1`)

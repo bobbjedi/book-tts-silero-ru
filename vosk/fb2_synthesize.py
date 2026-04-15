@@ -6,6 +6,7 @@ import argparse
 from concurrent.futures import ProcessPoolExecutor, as_completed
 import hashlib
 import json
+import os
 import re
 import shutil
 import subprocess
@@ -24,11 +25,45 @@ from .text_utils import replace_numbers_ru
 FB2_NS = {"fb": "http://www.gribuser.ru/xml/fictionbook/2.0"}
 _WORKER_MODEL = None
 _WORKER_SYNTH = None
+_WORKER_ACCENT = None
 
 
 def _log(message: str) -> None:
     ts = datetime.now().strftime("%H:%M:%S")
     print("[{0}] {1}".format(ts, message), flush=True)
+
+
+def _repo_root() -> Path:
+    return Path(__file__).resolve().parents[1]
+
+
+def _load_dotenv_simple(path: Path) -> None:
+    """Минимальный .env: KEY=VALUE, без экспорта shell-специфики."""
+    if not path.exists():
+        return
+    for raw in path.read_text(encoding="utf-8").splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        if "=" not in line:
+            continue
+        key, val = line.split("=", 1)
+        key = key.strip()
+        val = val.strip().strip('"').strip("'")
+        if not key:
+            continue
+        if key not in os.environ:
+            os.environ[key] = val
+
+
+def _default_ruaccent_models_dir() -> Path:
+    """Общий каталог моделей ruaccent (вне output/work)."""
+    env_dir = os.environ.get("RUACCENT_MODELS_DIR", "").strip()
+    if env_dir:
+        return Path(env_dir).expanduser()
+    xdg_cache_home = os.environ.get("XDG_CACHE_HOME", "").strip()
+    cache_root = Path(xdg_cache_home).expanduser() if xdg_cache_home else (Path.home() / ".cache")
+    return cache_root / "book-tts-silero-ru" / "ruaccent_models"
 
 
 def _safe_name(name: str, max_len: int = 120) -> str:
@@ -115,9 +150,41 @@ def _normalize_for_vosk(text: str) -> str:
         .replace("—", "-")
         .replace("–", "-")
         .replace("…", ".")
+        .replace("...", ".")
+        .replace(". . .", ".")
     )
     t = re.sub(r"\.{3,}", ".", t)
     return re.sub(r"\s+", " ", t).strip()
+
+
+def _normalize_for_ruaccent(text: str) -> str:
+    # Минимальная нормализация, чтобы не ломать токенизацию ruaccent.
+    t = text.strip()
+    t = (
+        t.replace("„", '"')
+        .replace("“", '"')
+        .replace("”", '"')
+        .replace("«", '"')
+        .replace("»", '"')
+        .replace("‘", "'")
+        .replace("’", "'")
+    )
+    return re.sub(r"\s+", " ", t).strip()
+
+
+def _maybe_accent_paragraphs(paragraphs: List[str], use_accent: bool) -> List[str]:
+    global _WORKER_ACCENT
+    if not use_accent:
+        return paragraphs
+    if _WORKER_ACCENT is None:
+        raise RuntimeError("accentizer is not initialized")
+    out: List[str] = []
+    for p in paragraphs:
+        prepared = _normalize_for_ruaccent(p)
+        if not prepared:
+            continue
+        out.append(_WORKER_ACCENT.process_all(prepared))
+    return out
 
 
 def _strip_unsupported_chars_by_model(text: str, model) -> str:
@@ -311,8 +378,11 @@ def _synthesize_chapter(
     speaker_id: int,
     max_chars: int,
     pause_sec: float,
+    use_accent: bool,
 ) -> Path:
     chapter_started = time.monotonic()
+    if use_accent:
+        paragraphs = _maybe_accent_paragraphs(paragraphs, use_accent=True)
     chapter_text = "\n\n".join(paragraphs)
     chapter_key = hashlib.sha1((chapter_title + "\n" + chapter_text).encode("utf-8")).hexdigest()[:16]
     chapter_work_dir = work_root / chapter_key
@@ -341,7 +411,7 @@ def _synthesize_chapter(
 
     if not chunks:
         raise ValueError("Пустой набор чанков в главе")
-    _log("start {0}: chunks={1}".format(base_name, len(chunks)))
+    _log("start {0}: chunks={1}, accent={2}".format(base_name, len(chunks), "yes" if use_accent else "no"))
 
     state_path = chapter_work_dir / "state.json"
     chunks_hash = _chunks_hash(chunks)
@@ -353,10 +423,11 @@ def _synthesize_chapter(
             old_state.get("speaker_id"),
             old_state.get("max_chars"),
             old_state.get("pause_sec"),
+            old_state.get("use_accent"),
             old_state.get("chunk_count"),
             old_state.get("chunks_hash"),
         )
-        new_sig = (speaker_id, max_chars, pause_sec, len(chunks), chunks_hash)
+        new_sig = (speaker_id, max_chars, pause_sec, bool(use_accent), len(chunks), chunks_hash)
         if old_sig != new_sig:
             _reset_parts_dir(parts_dir, "config or chunk signature changed")
 
@@ -368,6 +439,7 @@ def _synthesize_chapter(
                 "speaker_id": speaker_id,
                 "max_chars": max_chars,
                 "pause_sec": pause_sec,
+                "use_accent": bool(use_accent),
                 "chunks_hash": chunks_hash,
             },
             ensure_ascii=False,
@@ -416,12 +488,30 @@ def _synthesize_chapter(
     return mp3_path
 
 
-def _worker_init(model_name: str) -> None:
-    global _WORKER_MODEL, _WORKER_SYNTH
+def _worker_init(
+    model_name: str,
+    use_accent: bool,
+    accent_model_size: str,
+    accent_use_dictionary: bool,
+    accent_models_dir: str,
+) -> None:
+    global _WORKER_MODEL, _WORKER_SYNTH, _WORKER_ACCENT
     from vosk_tts import Model, Synth
 
     _WORKER_MODEL = Model(model_name=model_name)
     _WORKER_SYNTH = Synth(_WORKER_MODEL)
+    _WORKER_ACCENT = None
+    if use_accent:
+        from ruaccent import RUAccent
+
+        acc = RUAccent()
+        acc.load(
+            omograph_model_size=accent_model_size,
+            use_dictionary=accent_use_dictionary,
+            workdir=accent_models_dir or None,
+            repo="ruaccent/accentuator",
+        )
+        _WORKER_ACCENT = acc
 
 
 def _process_chapter_task(
@@ -434,6 +524,7 @@ def _process_chapter_task(
     speaker_id: int,
     max_chars: int,
     pause_sec: float,
+    use_accent: bool,
 ) -> Tuple[int, str, float]:
     global _WORKER_MODEL, _WORKER_SYNTH
     if _WORKER_MODEL is None or _WORKER_SYNTH is None:
@@ -451,6 +542,7 @@ def _process_chapter_task(
         speaker_id=speaker_id,
         max_chars=max_chars,
         pause_sec=pause_sec,
+        use_accent=use_accent,
     )
     elapsed = time.monotonic() - started
     return chapter_idx, str(result_path), elapsed
@@ -464,6 +556,10 @@ def synthesize_fb2_to_mp3_chapters(
     max_chars: int = 250,
     pause_sec: float = 0.03,
     workers: int = 1,
+    accent: bool = False,
+    accent_model_size: str = "turbo3.1",
+    accent_use_dictionary: bool = True,
+    accent_models_dir: Optional[Path] = None,
 ) -> Path:
     total_started = time.monotonic()
     chapters = extract_fb2_chapters(fb2_path)
@@ -476,9 +572,17 @@ def synthesize_fb2_to_mp3_chapters(
     work_root = output_dir / ".vosk_fb2_work"
     work_root.mkdir(parents=True, exist_ok=True)
 
+    if accent:
+        # Держим ruaccent-модели в одном общем каталоге, кэш/докачку делает сама библиотека.
+        models_dir = accent_models_dir.expanduser() if accent_models_dir else _default_ruaccent_models_dir()
+        models_dir.mkdir(parents=True, exist_ok=True)
+        _log("ruaccent models dir: {0}".format(models_dir))
+    else:
+        models_dir = None
+
     _log(
-        "chapters={0}, speaker_id={1}, max_chars={2}, pause={3}, workers={4}".format(
-            len(chapters), speaker_id, max_chars, pause_sec, workers
+        "chapters={0}, speaker_id={1}, max_chars={2}, pause={3}, workers={4}, accent={5}".format(
+            len(chapters), speaker_id, max_chars, pause_sec, workers, bool(accent)
         )
     )
     if workers == 1:
@@ -486,6 +590,19 @@ def synthesize_fb2_to_mp3_chapters(
 
         model = Model(model_name=model_name)
         synth = Synth(model)
+        global _WORKER_ACCENT
+        _WORKER_ACCENT = None
+        if accent:
+            from ruaccent import RUAccent
+
+            acc = RUAccent()
+            acc.load(
+                omograph_model_size=accent_model_size,
+                use_dictionary=accent_use_dictionary,
+                workdir=str(models_dir) if models_dir is not None else None,
+                repo="ruaccent/accentuator",
+            )
+            _WORKER_ACCENT = acc
         for i, (title, paragraphs) in enumerate(chapters, 1):
             chapter_started = time.monotonic()
             _log("[{0}/{1}] {2}".format(i, len(chapters), title))
@@ -499,6 +616,7 @@ def synthesize_fb2_to_mp3_chapters(
                 speaker_id=speaker_id,
                 max_chars=max_chars,
                 pause_sec=pause_sec,
+                use_accent=bool(accent),
             )
             chapter_elapsed = time.monotonic() - chapter_started
             _log("[{0}/{1}] runtime={2:.2f}s".format(i, len(chapters), chapter_elapsed))
@@ -507,7 +625,13 @@ def synthesize_fb2_to_mp3_chapters(
         with ProcessPoolExecutor(
             max_workers=workers,
             initializer=_worker_init,
-            initargs=(model_name,),
+            initargs=(
+                model_name,
+                bool(accent),
+                str(accent_model_size),
+                bool(accent_use_dictionary),
+                str(models_dir) if models_dir is not None else "",
+            ),
         ) as ex:
             for i, (title, paragraphs) in enumerate(chapters, 1):
                 fut = ex.submit(
@@ -521,6 +645,7 @@ def synthesize_fb2_to_mp3_chapters(
                     speaker_id,
                     max_chars,
                     pause_sec,
+                    bool(accent),
                 )
                 tasks.append(fut)
 
@@ -535,6 +660,8 @@ def synthesize_fb2_to_mp3_chapters(
 
 
 def main() -> None:
+    _load_dotenv_simple(_repo_root() / ".env")
+
     ap = argparse.ArgumentParser(description="Vosk TTS: FB2 -> MP3 (по главам)")
     ap.add_argument("input", help="Входной .fb2")
     ap.add_argument("-o", "--output-dir", help="Папка для MP3 глав")
@@ -543,6 +670,12 @@ def main() -> None:
     ap.add_argument("--max-chars", type=int, default=250, help="Лимит символов на чанк")
     ap.add_argument("--pause-sec", type=float, default=0.03, help="Пауза между чанками")
     ap.add_argument("--workers", type=int, default=1, help="Количество параллельных воркеров по главам")
+    ap.add_argument("--accent", action="store_true", help="Прогон текста через ruaccent (ставит '+' ударения)")
+    ap.add_argument("--accent-model-size", default="turbo3.1", help="Размер омограф-модели ruaccent")
+    ap.add_argument("--accent-use-dictionary", dest="accent_use_dictionary", action="store_true", help="ruaccent: использовать словарь (по умолчанию включен)")
+    ap.add_argument("--accent-no-dictionary", dest="accent_use_dictionary", action="store_false", help="ruaccent: отключить словарь")
+    ap.set_defaults(accent_use_dictionary=True)
+    ap.add_argument("--accent-models-dir", help="Папка с моделями ruaccent; по умолчанию общий кэш пользователя")
     args = ap.parse_args()
 
     inp = Path(args.input)
@@ -561,6 +694,10 @@ def main() -> None:
             max_chars=args.max_chars,
             pause_sec=args.pause_sec,
             workers=args.workers,
+            accent=bool(args.accent),
+            accent_model_size=str(args.accent_model_size),
+            accent_use_dictionary=bool(args.accent_use_dictionary),
+            accent_models_dir=Path(args.accent_models_dir) if args.accent_models_dir else None,
         )
     except ET.ParseError as exc:
         sys.exit("Некорректный FB2/XML: {0}".format(exc))
