@@ -381,14 +381,6 @@ def _synthesize_chapter(
     use_accent: bool,
 ) -> Path:
     chapter_started = time.monotonic()
-    if use_accent:
-        paragraphs = _maybe_accent_paragraphs(paragraphs, use_accent=True)
-    chapter_text = "\n\n".join(paragraphs)
-    chapter_key = hashlib.sha1((chapter_title + "\n" + chapter_text).encode("utf-8")).hexdigest()[:16]
-    chapter_work_dir = work_root / chapter_key
-    parts_dir = chapter_work_dir / "parts"
-    parts_dir.mkdir(parents=True, exist_ok=True)
-
     short_title = _short_chapter_title(chapter_title)
     safe_title = _safe_name(short_title)
     base_name = safe_title
@@ -398,6 +390,14 @@ def _synthesize_chapter(
     if mp3_path.exists() and mp3_path.stat().st_size > 0:
         _log("skip existing {0}".format(mp3_path.name))
         return mp3_path
+
+    if use_accent:
+        paragraphs = _maybe_accent_paragraphs(paragraphs, use_accent=True)
+    chapter_text = "\n\n".join(paragraphs)
+    chapter_key = hashlib.sha1((chapter_title + "\n" + chapter_text).encode("utf-8")).hexdigest()[:16]
+    chapter_work_dir = work_root / chapter_key
+    parts_dir = chapter_work_dir / "parts"
+    parts_dir.mkdir(parents=True, exist_ok=True)
 
     chunks_json_path = chapter_work_dir / "chunks.json"
     chunks = _load_cached_chunks(chunks_json_path, max_chars=max_chars)
