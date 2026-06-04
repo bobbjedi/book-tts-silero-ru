@@ -138,9 +138,9 @@ def synthesize_to_wav(
             part_path = tmp_dir / "part_{0:04d}.wav".format(idx)
             ssml_text = chunk.get("ssml", "").strip()
             if ssml_text:
-                model.save_wav(ssml_text=ssml_text, speaker=speaker, sample_rate=sample_rate, audio_path=str(part_path))
+                model.save_wav(ssml_text=ssml_text, speaker=speaker, sample_rate=sample_rate, audio_path=str(part_path), put_accent=True, put_yo=True)
             else:
-                model.save_wav(text=text, speaker=speaker, sample_rate=sample_rate, audio_path=str(part_path))
+                model.save_wav(text=text, speaker=speaker, sample_rate=sample_rate, audio_path=str(part_path), put_accent=True, put_yo=True)
             pt = (chunk.get("post_tone") or "").strip()
             if pt:
                 shifted = tmp_dir / "part_{0:04d}_pt.wav".format(idx)

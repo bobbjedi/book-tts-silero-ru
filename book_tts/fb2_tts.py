@@ -248,6 +248,7 @@ def _save_chunk_wav(model, chunk: Chunk, part_path: Path, speaker: str, sample_r
                 speaker=speaker,
                 sample_rate=sample_rate,
                 audio_path=str(part_path),
+                put_accent=True,
                 put_yo=True,
             )
             _apply_chunk_post_tone(part_path, chunk, sample_rate)
@@ -263,6 +264,7 @@ def _save_chunk_wav(model, chunk: Chunk, part_path: Path, speaker: str, sample_r
             speaker=speaker,
             sample_rate=sample_rate,
             audio_path=str(part_path),
+            put_accent=True,
             put_yo=True,
         )
         _apply_chunk_post_tone(part_path, chunk, sample_rate)
@@ -277,6 +279,7 @@ def _save_chunk_wav(model, chunk: Chunk, part_path: Path, speaker: str, sample_r
                     speaker=speaker,
                     sample_rate=sample_rate,
                     audio_path=str(part_path),
+                    put_accent=True,
                     put_yo=True,
                 )
                 _apply_chunk_post_tone(part_path, chunk, sample_rate)
